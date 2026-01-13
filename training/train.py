@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict
 
@@ -11,7 +10,7 @@ from torch.utils.data import DataLoader
 
 from data.collate import collate_fn
 from data.dataset import DummyPronunciationDataset
-from features.mfcc import MFCCConfig
+from features.logmel import LogMelConfig
 from models.pronunciation_model import ModelConfig, PronunciationModel
 from training.loss import PronunciationLoss
 from utils.audio import AudioConfig
@@ -25,13 +24,14 @@ def load_config(path: str) -> Dict[str, Any]:
 
 
 def build_model(cfg: Dict[str, Any]) -> PronunciationModel:
-    n_mfcc = cfg["feature"]["n_mfcc"]
-    input_dim = n_mfcc * 3 if cfg["feature"]["add_deltas"] else n_mfcc
+    n_mels = cfg["feature"]["n_mels"]
+    input_dim = n_mels * 3 if cfg["feature"]["add_deltas"] else n_mels
     model_cfg = ModelConfig(
         input_dim=input_dim,
-        cnn_channels=cfg["model"]["cnn_channels"],
-        lstm_hidden=cfg["model"]["lstm_hidden"],
-        lstm_layers=cfg["model"]["lstm_layers"],
+        ssl_dim=cfg["model"]["ssl_dim"],
+        pron_dim=cfg["model"]["pron_dim"],
+        transformer_heads=cfg["model"]["transformer_heads"],
+        transformer_layers=cfg["model"]["transformer_layers"],
         dropout=cfg["model"]["dropout"],
     )
     return PronunciationModel(model_cfg)
@@ -51,9 +51,9 @@ def main() -> None:
         sample_rate=cfg["sample_rate"],
         max_audio_seconds=cfg["max_audio_seconds"],
     )
-    feat_cfg = MFCCConfig(
+    feat_cfg = LogMelConfig(
         sample_rate=cfg["sample_rate"],
-        n_mfcc=cfg["feature"]["n_mfcc"],
+        n_mels=cfg["feature"]["n_mels"],
         n_fft=cfg["feature"]["n_fft"],
         hop_length=cfg["feature"]["hop_length"],
         win_length=cfg["feature"]["win_length"],
@@ -64,15 +64,17 @@ def main() -> None:
         size=cfg["data"]["train_size"],
         audio_cfg=audio_cfg,
         feat_cfg=feat_cfg,
-        num_phonemes=cfg["data"]["num_phonemes"],
-        max_phoneme_frames=cfg["data"]["max_phoneme_frames"],
+        phoneme_vocab_size=cfg["data"]["phoneme_vocab_size"],
+        min_phonemes=cfg["data"]["min_phonemes"],
+        max_phonemes=cfg["data"]["max_phonemes"],
     )
     val_set = DummyPronunciationDataset(
         size=cfg["data"]["val_size"],
         audio_cfg=audio_cfg,
         feat_cfg=feat_cfg,
-        num_phonemes=cfg["data"]["num_phonemes"],
-        max_phoneme_frames=cfg["data"]["max_phoneme_frames"],
+        phoneme_vocab_size=cfg["data"]["phoneme_vocab_size"],
+        min_phonemes=cfg["data"]["min_phonemes"],
+        max_phonemes=cfg["data"]["max_phonemes"],
     )
 
     train_loader = DataLoader(
@@ -89,7 +91,10 @@ def main() -> None:
     )
 
     model = build_model(cfg).to(device)
-    criterion = PronunciationLoss()
+    criterion = PronunciationLoss(
+        utterance_weight=cfg["training"]["loss_weights"]["utterance"],
+        phoneme_weight=cfg["training"]["loss_weights"]["phoneme"],
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg["training"]["learning_rate"],
@@ -103,18 +108,17 @@ def main() -> None:
         for step, batch in enumerate(train_loader):
             features = batch["features"].to(device)
             feat_lengths = batch["feat_lengths"].to(device)
-            segments = batch["phoneme_segments"].to(device)
-            seg_lengths = batch["seg_lengths"].to(device)
-            scores = batch["scores"].to(device)
+            phoneme_lengths = batch["phoneme_lengths"].to(device)
             phoneme_scores = batch["phoneme_scores"].to(device)
+            utterance_scores = batch["utterance_scores"].to(device)
 
-            out = model(features, feat_lengths, segments, seg_lengths)
+            out = model(features, feat_lengths, phoneme_lengths)
             loss = criterion(
                 out["utterance_score"],
-                scores,
+                utterance_scores,
                 out["phoneme_scores"],
                 phoneme_scores,
-                seg_lengths,
+                out["phoneme_mask"],
             )
 
             optimizer.zero_grad()
@@ -131,12 +135,11 @@ def main() -> None:
             for batch in val_loader:
                 features = batch["features"].to(device)
                 feat_lengths = batch["feat_lengths"].to(device)
-                segments = batch["phoneme_segments"].to(device)
-                seg_lengths = batch["seg_lengths"].to(device)
-                scores = batch["scores"].to(device)
-                out = model(features, feat_lengths, segments, seg_lengths)
+                phoneme_lengths = batch["phoneme_lengths"].to(device)
+                utterance_scores = batch["utterance_scores"].to(device)
+                out = model(features, feat_lengths, phoneme_lengths)
                 all_pred.append(out["utterance_score"].cpu())
-                all_target.append(scores.cpu())
+                all_target.append(utterance_scores.cpu())
             pred = torch.cat(all_pred)
             target = torch.cat(all_target)
             logger.info("val_mae=%.3f val_rmse=%.3f", mae(pred, target), rmse(pred, target))

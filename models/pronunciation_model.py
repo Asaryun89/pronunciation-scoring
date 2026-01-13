@@ -1,112 +1,118 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
 
 import torch
 from torch import nn
-from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 
 @dataclass
 class ModelConfig:
     input_dim: int
-    cnn_channels: list
-    lstm_hidden: int
-    lstm_layers: int
+    ssl_dim: int
+    pron_dim: int
+    transformer_heads: int
+    transformer_layers: int
     dropout: float
 
 
 class PronunciationModel(nn.Module):
-    """CNN + BiLSTM pronunciation scoring model."""
+    """SSL encoder + pronunciation encoder + phoneme scoring head + aggregation."""
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
-        layers = []
-        in_ch = config.input_dim
-        for ch in config.cnn_channels:
-            layers.append(nn.Conv1d(in_ch, ch, kernel_size=3, padding=1))
-            layers.append(nn.ReLU())
-            layers.append(nn.Dropout(config.dropout))
-            in_ch = ch
-        self.cnn = nn.Sequential(*layers)
+        self.ssl_encoder = nn.Sequential(
+            nn.Linear(config.input_dim, config.ssl_dim),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.LayerNorm(config.ssl_dim),
+        )
 
-        self.lstm = nn.LSTM(
-            input_size=in_ch,
-            hidden_size=config.lstm_hidden,
-            num_layers=config.lstm_layers,
+        self.pron_conv = nn.Sequential(
+            nn.Conv1d(config.ssl_dim, config.pron_dim, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.pron_dim,
+            nhead=config.transformer_heads,
+            dropout=config.dropout,
             batch_first=True,
-            bidirectional=True,
-            dropout=config.dropout if config.lstm_layers > 1 else 0.0,
+        )
+        self.pron_transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=config.transformer_layers,
         )
 
-        lstm_out = config.lstm_hidden * 2
-        self.segment_head = nn.Sequential(
-            nn.Linear(lstm_out, lstm_out),
+        self.frame_scorer = nn.Sequential(
+            nn.Linear(config.pron_dim, config.pron_dim),
             nn.ReLU(),
             nn.Dropout(config.dropout),
-            nn.Linear(lstm_out, 1),
+            nn.Linear(config.pron_dim, 1),
         )
-        self.utterance_head = nn.Sequential(
-            nn.Linear(lstm_out, lstm_out),
-            nn.ReLU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(lstm_out, 1),
-        )
+
+    def _segment_mean(self, frame_scores: torch.Tensor, phoneme_lengths: torch.Tensor) -> torch.Tensor:
+        """Pool frame-level scores into phoneme-level scores using alignment lengths."""
+        batch_size, max_frames = frame_scores.shape
+        max_phonemes = phoneme_lengths.shape[1]
+        phoneme_scores = torch.zeros(batch_size, max_phonemes, device=frame_scores.device)
+        for i in range(batch_size):
+            offset = 0
+            for j in range(max_phonemes):
+                length = int(phoneme_lengths[i, j].item())
+                if length <= 0:
+                    break
+                end = min(offset + length, max_frames)
+                if end > offset:
+                    phoneme_scores[i, j] = frame_scores[i, offset:end].mean()
+                offset = end
+        return phoneme_scores
 
     def forward(
         self,
         features: torch.Tensor,
         feat_lengths: torch.Tensor,
-        phoneme_segments: torch.Tensor,
-        seg_lengths: torch.Tensor,
+        phoneme_lengths: torch.Tensor,
     ) -> dict:
         """
         Args:
             features: (B, T, F)
             feat_lengths: (B,)
-            phoneme_segments: (B, S, 2) frame indices [start, end)
-            seg_lengths: (B,)
+            phoneme_lengths: (B, P)
         Returns:
-            dict with utterance_score and phoneme_scores
+            dict with frame_scores, phoneme_scores, utterance_score, and aggregates
         """
-        x = features.transpose(1, 2)  # (B, F, T)
-        x = self.cnn(x)
+        x = self.ssl_encoder(features)
+
+        x = x.transpose(1, 2)  # (B, C, T)
+        x = self.pron_conv(x)
         x = x.transpose(1, 2)  # (B, T, C)
 
-        packed = pack_padded_sequence(x, feat_lengths.cpu(), batch_first=True, enforce_sorted=False)
-        packed_out, _ = self.lstm(packed)
-        lstm_out, _ = pad_packed_sequence(packed_out, batch_first=True)
+        mask = torch.arange(x.size(1), device=x.device)[None, :] < feat_lengths[:, None]
+        x = self.pron_transformer(x, src_key_padding_mask=~mask)
 
-        # Utterance score from masked mean pooling
-        mask = torch.arange(lstm_out.size(1), device=lstm_out.device)[None, :] < feat_lengths[:, None]
-        masked = lstm_out * mask.unsqueeze(-1)
-        pooled = masked.sum(dim=1) / feat_lengths.unsqueeze(1).clamp_min(1)
-        utterance_score = self.utterance_head(pooled).squeeze(1)
+        frame_scores = self.frame_scorer(x).squeeze(-1)
+        frame_scores = frame_scores.masked_fill(~mask, 0.0)
 
-        # Phoneme-level scores via segment pooling
-        batch_scores = []
-        for b in range(lstm_out.size(0)):
-            segs = phoneme_segments[b, : seg_lengths[b]]
-            scores = []
-            for s, e in segs.tolist():
-                s = max(0, min(s, int(feat_lengths[b].item())))
-                e = max(s + 1, min(e, int(feat_lengths[b].item())))
-                seg_vec = lstm_out[b, s:e].mean(dim=0)
-                score = self.segment_head(seg_vec).squeeze(0)
-                scores.append(score)
-            if scores:
-                batch_scores.append(torch.stack(scores))
-            else:
-                batch_scores.append(torch.zeros((0,), device=lstm_out.device))
+        phoneme_scores = self._segment_mean(frame_scores, phoneme_lengths)
+        phoneme_mask = phoneme_lengths > 0
+        phoneme_sum = (phoneme_scores * phoneme_mask).sum(dim=1)
+        phoneme_count = phoneme_mask.sum(dim=1).clamp(min=1)
+        utterance_score = phoneme_sum / phoneme_count
 
-        max_len = max((s.shape[0] for s in batch_scores), default=0)
-        phoneme_scores = torch.zeros((lstm_out.size(0), max_len), device=lstm_out.device)
-        for i, s in enumerate(batch_scores):
-            if s.numel() > 0:
-                phoneme_scores[i, : s.shape[0]] = s
+        phoneme_mean = utterance_score
+        phoneme_std = torch.sqrt(
+            ((phoneme_scores - phoneme_mean[:, None]) ** 2 * phoneme_mask).sum(dim=1) / phoneme_count
+        )
+        fluency_score = (100.0 - torch.clamp(phoneme_std * 10.0, max=100.0)).clamp(min=0.0)
+        prosody_score = 0.5 * (phoneme_mean + fluency_score)
 
         return {
-            "utterance_score": utterance_score,
+            "frame_scores": frame_scores,
             "phoneme_scores": phoneme_scores,
+            "phoneme_mask": phoneme_mask,
+            "utterance_score": utterance_score,
+            "accuracy_score": phoneme_mean,
+            "fluency_score": fluency_score,
+            "prosody_score": prosody_score,
         }
