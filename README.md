@@ -3,10 +3,12 @@
 This project provides an end-to-end, modular PyTorch baseline for Computer-Aided Pronunciation Training (CAPT). It takes a 16 kHz WAV file, extracts log-Mel features, and predicts an overall pronunciation score (0-100) using a CNN + BiLSTM model with attention pooling.
 
 ## Features
-- WAV input (16 kHz), normalize and trim silence
-- Log-Mel features (optionally with deltas)
-- CNN + BiLSTM regression model with attention pooling
-- Config-driven training and inference
+- Reference text to phonemes via G2P
+- Phoneme alignment (forced align / CTC / HMM)
+- Audio preprocessing to waveform/log-Mel, SSL speech encoder embeddings
+- Pronunciation encoder (Conv1D + Transformer MSA)
+- Phoneme-level scoring head (Neural GOP / CTC / DNN) with aggregation
+- Optional LLM adapter for feedback and final outputs
 
 ## New Workflow
 
