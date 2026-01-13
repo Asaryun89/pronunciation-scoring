@@ -1,0 +1,25 @@
+seed: 42
+sample_rate: 16000
+max_audio_seconds: 10.0
+feature:
+  n_mfcc: 13
+  n_fft: 400
+  hop_length: 160
+  win_length: 400
+  add_deltas: true
+model:
+  cnn_channels: [32, 64]
+  lstm_hidden: 128
+  lstm_layers: 2
+  dropout: 0.2
+training:
+  batch_size: 4
+  num_epochs: 3
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  log_every: 10
+data:
+  train_size: 32
+  val_size: 8
+  num_phonemes: 40
+  max_phoneme_frames: 200
