@@ -4,14 +4,14 @@ This project provides a classical signal-processing–based baseline for English
 The system compares a learner’s speech with a native speaker reference recording and identifies pronunciation errors using time alignment and acoustic feature distance.
 The system processes 16 kHz WAV audio, extracts MFCC and pitch features, aligns speech segments using Dynamic Time Warping (DTW) or Forced Alignment, and computes pronunciation scores based on Euclidean distance.
 
-# Objectives
+## Objectives
 
 - Compare learner pronunciation with native speaker pronunciation
 - Detect mispronounced words and phonemes
 - Provide an interpretable pronunciation score (0–100)
 - Visualize acoustic differences between speakers
 
-# Features
+## Features
 
 - Native–learner speech comparison
 - Word-level and phoneme-level alignment
@@ -20,7 +20,7 @@ The system processes 16 kHz WAV audio, extracts MFCC and pitch features, aligns 
 - Distance-based pronunciation scoring
 - Error localization (which word is wrong)
 
-# Dataset Preparation
+## Dataset Preparation
 - 10–20 English sentences
 - Spoken by native speakers
 - Clean recording (16 kHz, mono WAV)
@@ -29,7 +29,7 @@ The system processes 16 kHz WAV audio, extracts MFCC and pitch features, aligns 
 - Spoken by Vietnamese learners
 - Recorded under similar conditions
 
-# System Workflow
+## System Workflow
 
 ```
 Reference Sentence Text
