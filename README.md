@@ -32,7 +32,7 @@ The system processes 16 kHz WAV audio, extracts MFCC and pitch features, aligns 
 ## System Workflow
 
 ```
-Reference Sentence Text
+Reference Sentence Text (Optional)
         |
         v
 +-----------------------------------+
@@ -121,4 +121,9 @@ Learner Audio Input                         |
 | - Word-level error detection                     |
 | - Distance visualization                         |
 +--------------------------------------------------+
+```
+## Run
+
+```
+python main.py --learner-audio path/to/learner.wav --reference-audio path/to/reference.wav
 ```

@@ -3,10 +3,19 @@ sample_rate: 16000
 max_audio_seconds: 10.0
 feature:
   n_mels: 80
+  n_mfcc: 13
   n_fft: 400
   hop_length: 160
   win_length: 400
-  add_deltas: false
+  add_deltas: true
+pitch:
+  fmin: 50.0
+  fmax: 500.0
+alignment:
+  method: dtw
+scoring:
+  pitch_weight: 0.01
+  distance_scale: 10.0
 model:
   ssl_dim: 128
   pron_dim: 128
