@@ -216,5 +216,5 @@ Learner speech:
 ## Run Inference 
 
 ```bash
-python.exe inference.test --mav "Path to mav file"
+python.exe inference.infer --mav "Path to mav file"
 ```
