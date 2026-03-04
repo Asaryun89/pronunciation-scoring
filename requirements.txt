@@ -1,7 +1,11 @@
-torch
-torchaudio
-librosa
 numpy
 scipy
-matplotlib
-pyyaml
+torch
+torchaudio
+transformers
+soundfile
+webrtcvad
+faster-whisper
+fastapi
+uvicorn
+pydantic

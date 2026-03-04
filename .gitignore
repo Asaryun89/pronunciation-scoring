@@ -21,6 +21,7 @@ checkpoints/
 # Data / artifacts
 data/*
 !data/.gitkeep
+audio/*
 
 # OS
 .DS_Store
