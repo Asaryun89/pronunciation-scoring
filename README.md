@@ -216,5 +216,44 @@ Learner speech:
 ## Run Inference 
 
 ```bash
-python.exe inference.infer --mav "Path to mav file"
+python -m inference.infer --wav "path/to/audio.wav" --lang en
+```
+
+## HuBERT Embedding Example
+
+```python
+from utils.preprocessing import preprocess_wav
+from models.hubert_encoder import HubertEncoder, HubertConfig
+
+wav_path = "data/learner/01_learner.wav"
+audio, sr = preprocess_wav(wav_path, target_sr=16000, use_vad=True)
+
+encoder = HubertEncoder(HubertConfig(
+    model_name="facebook/hubert-base-ls960",
+    device="cpu",
+))
+
+emb, frame_hz = encoder.encode(audio, sr=sr)
+print("Embedding shape:", emb.shape)  # (T, D)
+print("Frame rate (Hz):", frame_hz)
+```
+
+## Whisper ASR Alignment Example
+
+```python
+from utils.preprocessing import preprocess_wav
+from models.asr_aligner import ASRAligner, ASRConfig
+
+wav_path = "data/learner/01_learner.wav"
+audio, sr = preprocess_wav(wav_path, target_sr=16000, use_vad=True)
+
+aligner = ASRAligner(ASRConfig(
+    model_size="small",
+    device="cpu",
+    compute_type="int8",
+))
+
+asr = aligner.transcribe_with_timestamps(audio, sr=sr, language="en")
+print("Text:", asr["text"])
+print("Words:", asr["words"][:5])  # first 5 timestamped words
 ```
