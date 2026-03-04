@@ -213,8 +213,8 @@ Learner speech:
               └────────────────────────────────────────────────┘
 ```
 
-## Run
+## Run Inference 
 
 ```bash
-python main.py --learner-audio path/to/learner.wav --reference-audio path/to/reference.wav
+python.exe inference.test --mav "Path to mav file"
 ```
