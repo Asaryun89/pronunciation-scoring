@@ -1,259 +1,184 @@
-# English Pronunciation Scoring System
+# Pronunciation Scoring — Inference Package
 
-A modular pronunciation scoring pipeline built on self-supervised speech representations. The system combines HuBERT embeddings, lightweight ASR alignment, and multi-head scoring to evaluate pronunciation at phoneme, word, and utterance levels.
+An end-to-end pronunciation scoring pipeline built on HuBERT + Faster-Whisper.
+Accepts a WAV file (or raw numpy array) and returns utterance-level and word-level pronunciation scores.
 
-## Overview
+---
 
-The project is designed for both research and production-style deployment, with focus on:
+## Architecture
 
-- Pronunciation accuracy scoring
-- Prosody and fluency modeling
-- Error localization for actionable learner feedback
-- Structured output for downstream applications
+```
+WAV → Preprocess → HuBERT encoder ─┐
+                                    ├─→ HubertMultiTask → scores (0–10)
+           Whisper ASR ─────────────┘
+           (word timestamps + transcript)
+```
 
-## Objectives
+The model (`HubertMultiTask`) was fine-tuned on SpeechOcean762 and outputs five utterance scores on the 0–10 scale:
+`accuracy`, `completeness`, `fluency`, `prosodic`, `total`.
 
-- Evaluate learner pronunciation using deep contextual speech representations
-- Provide phoneme-level and word-level error localization
-- Generate an overall pronunciation score (0-100)
-- Model prosody, fluency, and rhythm
-- Produce structured feedback output for user-facing applications
+---
 
-## Core Components
+## Setup
 
-### 1. HuBERT Encoder
+### 1. Clone and create environment
 
-A self-supervised Transformer-based model that extracts rich acoustic representations from raw waveform input.
+```bash
+git clone <repo-url>
+cd pronunciation-scoring
+python -m venv .venv
+# Windows:
+.venv\Scripts\activate
+# Linux / macOS:
+source .venv/bin/activate
+```
 
-- Input: 16 kHz waveform
-- Output: frame-level embeddings with shape `[T x D]`
+### 2. Install dependencies
 
-Where:
+```bash
+pip install -r requirements.txt
+```
 
-- `T`: number of time frames
-- `D`: embedding dimension per frame
+> **GPU (recommended):** Replace the CPU torch wheel with a CUDA-enabled one:
+> ```bash
+> pip install torch --index-url https://download.pytorch.org/whl/cu128
+> ```
 
-HuBERT captures:
+### 3. Download the checkpoint
 
-- Phonetic structure
-- Coarticulation effects
-- Accent variation
-- Prosody and rhythm
-- Temporal dependencies
+Place the trained model weights at:
+```
+ckpt_hubert_multitask/best.pt
+```
 
-### 2. Lightweight ASR Alignment Model
+The checkpoint is not distributed in this repo (binary too large). Obtain it from the team's shared storage or contact the maintainer.
 
-Provides temporal segmentation of words and phonemes.
+---
 
-- Purpose: alignment only (not scoring)
-- Typical options:
-  - Small CTC-based ASR
-  - Whisper-tiny
-  - Distilled wav2vec2
+## Quick start
 
-Outputs:
+### CLI
 
-- Transcript
-- Word timestamps
-- Optional phoneme timestamps
+```bash
+python -m inference.infer --wav path/to/audio.wav --lang en
+```
 
-Example:
+With an explicit checkpoint path:
 
-```text
-Input speech: "She sells sea shells"
+```bash
+python -m inference.infer --wav path/to/audio.wav --lang en \
+    --checkpoint ckpt_hubert_multitask/best.pt
+```
 
-ASR output:
+### Python API
+
+```python
+from inference.predictor import PronunciationPredictor, PredictorConfig
+
+predictor = PronunciationPredictor(PredictorConfig(
+    checkpoint_path = "ckpt_hubert_multitask/best.pt",
+    device          = "cuda",   # or "cpu"
+    whisper_size    = "small",
+    language        = "en",
+))
+
+result = predictor.predict("path/to/audio.wav", language="en")
+print(result["total"])       # overall score 0–10
+print(result["accuracy"])    # accuracy sub-score 0–10
+```
+
+### Notebook
+
+Open [run_inference.ipynb](run_inference.ipynb) for an interactive demo with waveform visualization and a word-by-word score table.
+
+---
+
+## FastAPI server
+
+```bash
+CHECKPOINT_PATH=ckpt_hubert_multitask/best.pt uvicorn inference.api:app --host 0.0.0.0 --port 8000
+```
+
+Interactive docs: `http://localhost:8000/docs`
+
+**POST `/score`**
+
+| Field      | Type   | Description                     |
+|------------|--------|---------------------------------|
+| `file`     | file   | WAV audio file (multipart form) |
+| `language` | string | ISO-639-1 code, default `"en"`  |
+
+---
+
+## Output schema
+
+```json
 {
-  "transcript": "She sells sea shells",
-  "word_timestamps_sec": [
-    {"word": "She", "start": 0.12, "end": 0.40},
-    {"word": "sells", "start": 0.41, "end": 0.80},
-    {"word": "sea", "start": 0.81, "end": 1.05},
-    {"word": "shells", "start": 1.06, "end": 1.45}
-  ]
+  "accuracy":     8.2,
+  "completeness": 9.0,
+  "fluency":      7.5,
+  "prosodic":     7.8,
+  "total":        8.1,
+  "text":         "she sells sea shells",
+  "words": [
+    {
+      "text":    "she",
+      "start":   0.12,
+      "end":     0.40,
+      "asr_prob": 0.97,
+      "accuracy": null,
+      "total":    null
+    }
+  ],
+  "audio": { "path": "path/to/audio.wav" },
+  "inference_metadata": {
+    "language":         "en",
+    "duration":         2.4,
+    "frame_hz":         50,
+    "prosody_features": { "f0_mean": 180.3, "speaking_rate": 4.1, "...": "..." },
+    "scoring_validity": "trained:ckpt_hubert_multitask/best.pt"
+  }
 }
 ```
 
-### 3. Alignment Mapping
+> **Note:** `words[].accuracy` and `words[].total` are `null` — word-level scoring requires a separate word-level model head not yet trained. Word entries carry timestamps (`start`, `end`) and ASR confidence (`asr_prob`) only.
 
-Maps HuBERT frame embeddings to linguistic segments.
+---
 
-Each segment looks like:
+## Repository layout
 
 ```
-frames 0–120   → "She"
-frames 121–300 → "sells"
-frames 301–410 → "sea"
-frames 411–580 → "shells"
+inference/
+  api.py          — FastAPI app (POST /score)
+  predictor.py    — PronunciationPredictor class (main entry point)
+  infer.py        — CLI wrapper
+
+models/
+  hubert_multitask.py  — HubertMultiTask model definition
+  asr_aligner.py       — Faster-Whisper wrapper
+  scoring_heads.py     — utterance scoring MLP heads
+  constants.py         — shared dimension/scale constants
+  ctc_aligner.py       — CTC forced aligner (optional, not used by default)
+
+utils/
+  preprocessing.py — resample, VAD, normalize
+  prosody.py       — F0 / energy / rate feature extraction
+  alignment.py     — frame-to-word span mapping
+
+notebook_infer/
+  pipeline.py      — score_file() / score_array() helpers for notebooks
+  display.py       — rich display utilities (waveform plot, score table)
+
+run_inference.ipynb  — interactive demo notebook
 ```
 
-For each segment:
+---
 
-```text
-z_segment = Pool(E[t_start:t_end])
-```
+## Requirements
 
-Where:
+- Python 3.10+
+- PyTorch 2.x (CPU or CUDA)
+- faster-whisper, transformers, soundfile, webrtcvad
+- fastapi + uvicorn (for the API server)
 
-- `E` = HuBERT frame embeddings
-- `Pool` = mean pooling or attention pooling
-
-### 4. Multi-Head Neural Scoring Network
-
-Predicts pronunciation quality at multiple granularities.
-
-- Phoneme head
-  - Input: phoneme embedding
-  - Output: score in `[0, 1]`
-- Word head
-  - Input: aggregated phoneme embeddings
-  - Output: score in `[0, 1]`
-- Utterance head
-  - Input: global embedding
-  - Output: overall score `(0-100)`
-- Prosody head
-  - Inputs: pitch (F0 statistics), energy contour, speaking rate, pause duration
-  - Outputs: fluency score, rhythm score, intonation score
-
-## Pronunciation Grading Outputs
-
-- Phoneme-level scores
-- Word-level scores
-- Utterance-level overall score
-- Prosody and fluency evaluation
-- Structured feedback output
-
-## Feature Highlights
-
-- HuBERT encoder for acoustic representation (act as feature extraction, conduct to utterance evaluation)
-- Lightweight ASR for word/phoneme alignment (get timestamps for word/phoneme/sentence)
-- Multi-head neural scoring network
-- Error localization (mispronounced words/segments)
-
-## Dataset Preparation
-
-Reference speech:
-
-- 10-20 English sentences
-- Spoken by native speakers
-- Clean recordings (16 kHz, mono WAV)
-
-Learner speech:
-
-- Same sentence set as reference
-- Spoken by Vietnamese learners
-- Recorded under similar acoustic conditions
-
-## System Workflow
-
-```text
-                           ┌───────────────────────────┐
-                           │        Audio Input        │
-                           │   (16 kHz mono waveform)  │
-                           └─────────────┬─────────────┘
-                                         │
-                                         ▼
-                        ┌────────────────────────────────┐
-                        │  Preprocessing Module          │
-                        │  - Voice Activity Detection    │
-                        │  - Silence trimming            │
-                        │  - Optional denoising          │
-                        └────────────────┬───────────────┘
-                                         │
-                                         ▼
-        ┌────────────────────────────────────────────────────────────┐
-        │                    Parallel Processing                     │
-        └────────────────────────────────────────────────────────────┘
-                 │                                            │
-                 ▼                                            ▼
-     ┌─────────────────────────┐                 ┌─────────────────────────┐
-     │   HuBERT Encoder        │                 │  Lightweight ASR Model  │
-     │  (Self-Supervised SSL)  │                 │  (CTC / Whisper-tiny)   │
-     │                         │                 │                         │
-     │ Output: Frame-level     │                 │ Output: Transcript +    │
-     │ embeddings [T × D]      │                 │ Word/Phone timestamps   │
-     └─────────────┬───────────┘                 └─────────────┬───────────┘
-                   │                                           │
-                   └────────────────────┬──────────────────────┘
-                                        ▼
-                        ┌────────────────────────────────┐
-                        │  Alignment Mapping Module      │
-                        │  - Map frames to segments      │
-                        │  - Build segment frame ranges  │
-                        └────────────────┬───────────────┘
-                                         │
-                                         ▼
-                        ┌────────────────────────────────┐
-                        │  Segment Pooling Module        │
-                        │  - Mean/Attention pooling      │
-                        │  - Produce segment vectors     │
-                        └────────────────┬───────────────┘
-                                         │
-                                         ▼
-              ┌────────────────────────────────────────────────┐
-              │            Multi-Head Scoring Network          │
-              │  - Phoneme Scoring Head (0–1)                  │
-              │  - Word Scoring Head (0–1)                     │
-              │  - Utterance Scoring Head (0–100)              │
-              │  - Prosody Scoring Head                        │
-              └────────────────┬───────────────────────────────┘
-                               │
-                               ▼
-              ┌────────────────────────────────────────────────┐
-              │          Score Fusion & Calibration            │
-              │  Combine accuracy + fluency + prosody          │
-              └────────────────┬───────────────────────────────┘
-                               │
-                               ▼
-              ┌────────────────────────────────────────────────┐
-              │            Feedback Generation Module          │
-              │  - Highlight low-score words                   │
-              │  - Detect mispronounced phonemes               │
-              │  - Generate structured JSON output             │
-              └────────────────────────────────────────────────┘
-```
-
-## Run Inference 
-
-```bash
-python -m inference.infer --wav "path/to/audio.wav" --lang en
-```
-
-## HuBERT Embedding Example
-
-```python
-from utils.preprocessing import preprocess_wav
-from models.hubert_encoder import HubertEncoder, HubertConfig
-
-wav_path = "data/learner/01_learner.wav"
-audio, sr = preprocess_wav(wav_path, target_sr=16000, use_vad=True)
-
-encoder = HubertEncoder(HubertConfig(
-    model_name="facebook/hubert-base-ls960",
-    device="cpu",
-))
-
-emb, frame_hz = encoder.encode(audio, sr=sr)
-print("Embedding shape:", emb.shape)  # (T, D)
-print("Frame rate (Hz):", frame_hz)
-```
-
-## Whisper ASR Alignment Example
-
-```python
-from utils.preprocessing import preprocess_wav
-from models.asr_aligner import ASRAligner, ASRConfig
-
-wav_path = "data/learner/01_learner.wav"
-audio, sr = preprocess_wav(wav_path, target_sr=16000, use_vad=True)
-
-aligner = ASRAligner(ASRConfig(
-    model_size="small",
-    device="cpu",
-    compute_type="int8",
-))
-
-asr = aligner.transcribe_with_timestamps(audio, sr=sr, language="en")
-print("Text:", asr["text"])
-print("Words:", asr["words"][:5])  # first 5 timestamped words
-```
+See [requirements.txt](requirements.txt) for the full pinned list.

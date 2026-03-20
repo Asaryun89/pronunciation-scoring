@@ -38,5 +38,20 @@ def basic_prosody_features(audio: np.ndarray, sr: int = 16000) -> dict:
     return feats
 
 def prosody_to_vector(feats: dict) -> np.ndarray:
-    keys = ["rms", "zcr", "peak_rate", "f0_mean", "f0_std"]
-    return np.array([feats.get(k, 0.0) for k in keys], dtype=np.float32)
+    """
+    Return a normalized 5-dim vector in approximately [0, 1].
+
+    Normalization constants are fixed (not dataset-dependent) so training and
+    inference produce the same values without a pre-computed mean/std:
+      rms        — already ~[0, 1] after peak-normalization of audio
+      zcr        — already ~[0, 0.5] for speech
+      peak_rate  — log1p then divide by 8.5  (covers up to ~5000 peaks/sec)
+      f0_mean    — divide by 400.0  (Hz; covers 0 and 80–400 Hz range)
+      f0_std     — divide by 80.0   (Hz; typical std is 0–80 Hz)
+    """
+    rms       = float(feats.get("rms",       0.0))
+    zcr       = float(feats.get("zcr",       0.0))
+    peak_rate = float(np.log1p(feats.get("peak_rate", 0.0)) / 8.5)
+    f0_mean   = float(feats.get("f0_mean",   0.0) / 400.0)
+    f0_std    = float(feats.get("f0_std",    0.0) / 80.0)
+    return np.array([rms, zcr, peak_rate, f0_mean, f0_std], dtype=np.float32)

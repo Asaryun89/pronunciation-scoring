@@ -1,106 +1,168 @@
-from dataclasses import dataclass
-from typing import Dict, Any
+from dataclasses import dataclass, field
+from typing import Dict, Any, Optional, List
 import numpy as np
 import torch
+from transformers import AutoTokenizer
 
 from utils.preprocessing import preprocess_wav
-from utils.alignment import build_word_segments
-from utils.pooling import mean_pool, utt_pool_mean_std
 from utils.prosody import basic_prosody_features, prosody_to_vector
-from utils.fusion import fuse_scores
 
-from models.hubert_encoder import HubertEncoder, HubertConfig
 from models.asr_aligner import ASRAligner, ASRConfig
-from models.scoring_heads import MultiHeadScorer, ScoringConfig
+from models.constants import SENT_DIMS, SENT_SCALE
+from models.hubert_multitask import HubertMultiTask
+
 
 @dataclass
 class PredictorConfig:
-    device: str = "cpu"
-    hubert_name: str = "facebook/hubert-base-ls960"
-    whisper_size: str = "small"
-    whisper_device: str = "cpu"
-    whisper_compute_type: str = "int8"
+    device:              str            = "cpu"
+    hubert_name:         str            = "facebook/hubert-base-ls960"
+    whisper_size:        str            = "small"
+    whisper_device:      str            = "cpu"
+    whisper_compute_type: str           = "int8"
+    checkpoint_path:     Optional[str]  = None
+    text_model_name:     str            = "Qwen/Qwen3-Embedding-0.6B"
+    """
+    Path to a trained HubertMultiTask checkpoint (.pt file).
+    If None, the model runs with random weights — scores are not meaningful.
+    """
+
 
 class PronunciationPredictor:
+    """
+    End-to-end pronunciation scoring using a fine-tuned HubertMultiTask model.
+
+    Pipeline:
+        1. Preprocess wav (resample, VAD, normalize)
+        2. Feature-extract for HuBERT
+        3. ASR for word timestamps (Faster-Whisper)
+        4. HubertMultiTask.forward_inference() with ASR-aligned word spans
+        5. Scale outputs from [0, 1] → [0, 10] (SpeechOcean scale)
+        6. Return structured JSON matching dataset annotation schema
+    """
+
     def __init__(self, cfg: PredictorConfig):
-        self.cfg = cfg
+        self.cfg    = cfg
+        self.device = torch.device(cfg.device)
 
-        self.encoder = HubertEncoder(HubertConfig(model_name=cfg.hubert_name, device=cfg.device))
-        self.aligner = ASRAligner(ASRConfig(model_size=cfg.whisper_size, device=cfg.whisper_device, compute_type=cfg.whisper_compute_type))
+        # Text tokenizer for linguistic embedding stream
+        self.text_tokenizer = (
+            AutoTokenizer.from_pretrained(cfg.text_model_name)
+            if cfg.text_model_name else None
+        )
 
-        # Build scorer with correct dims after we know encoder dim
-        # We'll init lazily on first call.
-        self.scorer = None
-        self.scorer_device = torch.device(cfg.device)
+        # Unified model
+        self.model = HubertMultiTask(
+            model_name=cfg.hubert_name,
+            dropout=0.0,        # dropout off at inference
+            freeze_fe=True,
+            text_model_name=cfg.text_model_name or None,
+            freeze_text_encoder=True,
+        ).to(self.device)
 
-    def _lazy_init_scorer(self, emb_dim: int):
-        utt_dim = emb_dim * 2  # mean+std pooling
-        scfg = ScoringConfig(emb_dim=emb_dim, utt_dim=utt_dim, prosody_dim=5, hidden=256)
-        self.scorer = MultiHeadScorer(scfg).to(self.scorer_device)
-        self.scorer.eval()
-        # NOTE: This is an untrained scorer by default.
-        # Replace weights by loading your trained checkpoint in real usage.
+        if cfg.checkpoint_path is not None:
+            state = torch.load(cfg.checkpoint_path, map_location=self.device, weights_only=True)
+            self.model.load_state_dict(state, strict=False)
+            self._scoring_validity = f"trained:{cfg.checkpoint_path}"
+        else:
+            self._scoring_validity = "untrained_random_init"
 
-    @torch.inference_mode()
+        self.model.eval()
+
+        # ASR aligner for word timestamps
+        self.aligner = ASRAligner(
+            ASRConfig(
+                model_size=cfg.whisper_size,
+                device=cfg.whisper_device,
+                compute_type=cfg.whisper_compute_type,
+            )
+        )
+
     def predict(self, wav_path: str, language: str = "en") -> Dict[str, Any]:
+        # ---- 1. Preprocess ----
         audio, sr = preprocess_wav(wav_path, target_sr=16000, use_vad=True)
+        audio_duration = len(audio) / sr
 
-        emb, frame_hz = self.encoder.encode(audio, sr=sr)  # (T,D)
-        T, D = emb.shape
+        # ---- 2. Normalize and convert to tensor (replaces Wav2Vec2FeatureExtractor) ----
+        audio_norm   = (audio - audio.mean()) / (audio.std() + 1e-7)
+        input_values = torch.tensor(audio_norm, dtype=torch.float32) \
+                           .unsqueeze(0).to(self.device)       # (1, T_samples)
 
-        if self.scorer is None:
-            self._lazy_init_scorer(D)
+        # ---- 3. ASR word timestamps ----
+        asr = self.aligner.transcribe_with_timestamps(
+            audio, sr=sr, language=language
+        )
 
-        asr = self.aligner.transcribe_with_timestamps(audio, sr=sr, language=language)
-        word_segments = build_word_segments(asr["words"], frame_hz=frame_hz, T=T)
+        # ---- 4. Prosody features — computed once, used in both model and metadata ----
+        p_feats = basic_prosody_features(audio, sr=sr)
+        p_vec   = prosody_to_vector(p_feats)                          # normalized (5,)
+        prosody_tensor = torch.tensor(p_vec, dtype=torch.float32) \
+                              .unsqueeze(0).to(self.device)           # (1, 5)
 
-        # Word embeddings
-        z_words = []
-        words_out = []
-        for seg in word_segments:
-            z = mean_pool(emb, seg["i0"], seg["i1"])
-            z_words.append(z)
+        # ---- 5. Tokenize ASR transcript for text embedding stream ----
+        text_input_ids      = None
+        text_attention_mask = None
+        if self.text_tokenizer is not None:
+            text_enc = self.text_tokenizer(
+                asr["text"],
+                return_tensors="pt",
+                truncation=True,
+                max_length=128,
+            )
+            text_input_ids      = text_enc["input_ids"].to(self.device)
+            text_attention_mask = text_enc["attention_mask"].to(self.device)
+
+        # ---- 6. Model inference (ASR-aligned spans + prosody + text) ----
+        out = self.model.forward_inference(
+            input_values=input_values,
+            word_timestamps=asr["words"],
+            audio_duration=audio_duration,
+            prosody_feats=prosody_tensor,
+            text_input_ids=text_input_ids,
+            text_attention_mask=text_attention_mask,
+        )
+        # out keys: sent_pred (5,), word_pred list[float], word_spans list[dict], frame_hz
+
+        # ---- 7. Scale sentence scores [0,1] → [0,10] ----
+        sent_pred = out["sent_pred"]  # np.ndarray (5,), order = SENT_DIMS
+        sent_scaled = {dim: float(sent_pred[i]) * SENT_SCALE for i, dim in enumerate(SENT_DIMS)}
+
+        # ---- 8. Build word output list ----
+        # Word-level scoring is not available in the utterance-level model.
+        # Word spans are retained for timestamp metadata only.
+        word_spans = out["word_spans"]
+
+        words_out: List[Dict[str, Any]] = []
+        for span in word_spans:
             words_out.append({
-                "word": seg["word"],
-                "start": seg["start_s"],
-                "end": seg["end_s"],
-                "asr_prob": seg["asr_prob"]
+                "text":              span["word"],
+                "accuracy":          None,   # word-level model not yet trained
+                "stress":            None,   # requires phone-level forced alignment
+                "total":             None,   # word-level model not yet trained
+                "phones":            [],     # requires forced aligner
+                "phones-accuracy":   [],     # requires forced aligner
+                "mispronunciations": [],
+                "start":             span["start_s"],
+                "end":               span["end_s"],
+                "asr_prob":          span["asr_prob"],
             })
 
-        # Utterance embedding
-        z_utt = utt_pool_mean_std(emb)
-
-        # Prosody vector
-        p_feats = basic_prosody_features(audio, sr=sr)
-        p_vec = prosody_to_vector(p_feats)
-
-        # Torch tensors
-        if len(z_words) > 0:
-            z_words_t = torch.tensor(np.stack(z_words), device=self.scorer_device)
-            word_scores = self.scorer.forward_word(z_words_t).detach().cpu().numpy().tolist()
-            mean_word = float(np.mean(word_scores))
-        else:
-            word_scores = []
-            mean_word = 0.0
-
-        z_utt_t = torch.tensor(z_utt[None, :], device=self.scorer_device)
-        utt_score = float(self.scorer.forward_utt(z_utt_t).detach().cpu().item())
-
-        p_t = torch.tensor(p_vec[None, :], device=self.scorer_device)
-        prosody_score = float(self.scorer.forward_prosody(p_t).detach().cpu().item())
-
-        final = fuse_scores(utt_score_0_100=utt_score, mean_word_0_1=mean_word, prosody_0_1=prosody_score)
-
-        # Attach word scores
-        for i in range(len(words_out)):
-            words_out[i]["score"] = float(word_scores[i]) if i < len(word_scores) else None
-
+        # ---- 9. Return structured output ----
         return {
-            "text": asr["text"],
-            "overall_score": final,
-            "accuracy": mean_word * 100.0,
-            "fluency": utt_score,
-            "prosody": prosody_score * 100.0,
-            "prosody_features": p_feats,
-            "words": words_out
+            "accuracy":    sent_scaled["accuracy"],
+            "completeness": sent_scaled["completeness"],
+            "fluency":     sent_scaled["fluency"],
+            "prosodic":    sent_scaled["prosodic"],
+            "total":       sent_scaled["total"],
+            "text":        asr["text"],
+            "words":       words_out,
+            "audio": {
+                "path": wav_path,
+            },
+            "inference_metadata": {
+                "language":        asr.get("language"),
+                "duration":        asr.get("duration"),
+                "frame_hz":        out["frame_hz"],
+                "prosody_features": p_feats,
+                "scoring_validity": self._scoring_validity,
+            },
         }

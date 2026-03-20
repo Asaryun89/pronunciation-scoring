@@ -1,268 +1,251 @@
-# AGENTS.md
+# AGENTS.md — Integration Guide for Web Builders
 
-## Project: Pronunciation Scoring (Inference-First)
+This document is for teammates integrating the pronunciation scoring engine into a web product (frontend, backend, or full-stack).
 
-This repository currently implements an **inference-oriented pronunciation scoring pipeline** using:
+---
 
-- `HuBERT` embeddings (`facebook/hubert-base-ls960`)
-- `Faster-Whisper` word timestamp alignment
-- lightweight pooling/prosody feature extraction
-- a multi-head MLP scorer and score fusion
+## What this package does
 
-The primary entrypoints are under `inference/`.
+Given a WAV audio clip, it returns:
 
-## Current Architecture (As Implemented)
+- **5 utterance-level scores** (0–10): `accuracy`, `completeness`, `fluency`, `prosodic`, `total`
+- **Transcript** from Whisper ASR
+- **Per-word timestamps** (`start`, `end` in seconds) and ASR confidence (`asr_prob`)
+- **Prosody metadata**: F0 mean/std, speaking rate, energy, pause ratio
 
-### 1) Audio Preprocessing (`utils/preprocessing.py`)
+Word-level accuracy scores (`words[].accuracy`, `words[].total`) are `null` in the current model — the utterance-level scores are the reliable outputs to display to users.
 
-Pipeline:
+---
 
-1. Read wav with `soundfile`
-2. Convert to mono
-3. Resample with `scipy.signal.resample_poly` to 16 kHz
-4. Peak normalize
-5. Optional VAD trim with `webrtcvad`
-6. Peak normalize again
+## Option A — Use the FastAPI server (recommended for web)
 
-Key function:
+The fastest integration path. Your frontend or backend calls a single HTTP endpoint.
 
-- `preprocess_wav(path, target_sr=16000, use_vad=True)`
-
-### 2) Speech Representation (`models/hubert_encoder.py`)
-
-- Uses `Wav2Vec2FeatureExtractor` + `HubertModel`
-- Default model: `facebook/hubert-base-ls960`
-- Returns frame-level embeddings `(T, D)` and estimated `frame_hz`
-
-Key classes:
-
-- `HubertConfig`
-- `HubertEncoder.encode(audio, sr)`
-
-### 3) Timestamp Alignment (`models/asr_aligner.py`)
-
-- Uses `faster-whisper` (`WhisperModel`) for transcript + word timestamps
-- `word_timestamps=True`
-- Returns dictionary with:
-  - `text`
-  - `words` (word/start/end/prob)
-  - `language`
-  - `duration`
-
-Key classes:
-
-- `ASRConfig`
-- `ASRAligner.transcribe_with_timestamps(...)`
-
-### 4) Frame-to-Word Mapping (`utils/alignment.py`)
-
-- Converts timestamp seconds to frame indices using `frame_hz`
-- Builds valid `[i0, i1)` frame spans per word
-
-Key function:
-
-- `build_word_segments(word_ts, frame_hz, T)`
-
-### 5) Pooling (`utils/pooling.py`)
-
-- `mean_pool(emb, i0, i1)` for segment vectors
-- `utt_pool_mean_std(emb)` for utterance vector (`2D` dimension)
-
-### 6) Prosody Features (`utils/prosody.py`)
-
-Extracted features:
-
-- `rms`
-- `zcr`
-- `peak_rate`
-- `f0_mean` and `f0_std` (if `pyworld` available, else 0)
-
-Key functions:
-
-- `basic_prosody_features(audio, sr)`
-- `prosody_to_vector(feats)`
-
-### 7) Scoring Heads (`models/scoring_heads.py`)
-
-`MultiHeadScorer` contains:
-
-- `word_head`: outputs `[0,1]` via sigmoid
-- `utt_head`: outputs `[0,100]` via sigmoid * 100
-- `prosody_head`: outputs `[0,1]` via sigmoid
-
-### 8) Final Score Fusion (`utils/fusion.py`)
-
-Fused score in `[0,100]`:
-
-`final = alpha * (mean_word*100) + beta * utt_score + gamma * (prosody*100)`
-
-Default weights:
-
-- `alpha=0.6`
-- `beta=0.25`
-- `gamma=0.15`
-
-## Inference Flow
-
-Implemented in `inference/predictor.py`:
-
-1. Preprocess wav
-2. Encode HuBERT embeddings
-3. ASR word timestamps
-4. Map words to HuBERT frame spans
-5. Pool word embeddings + utterance embedding
-6. Extract prosody vector
-7. Run multi-head scorer
-8. Fuse scores
-9. Return structured JSON
-
-Output keys:
-
-- `text`
-- `overall_score`
-- `accuracy`
-- `fluency`
-- `prosody`
-- `prosody_features`
-- `words` (with per-word score)
-
-## Important Current Limitation
-
-The scorer in `PronunciationPredictor` is **randomly initialized** on first use and set to eval mode.
-
-- There is currently **no checkpoint loading** in `inference/predictor.py`
-- Scores are not meaningful for production until trained weights are added
-
-Agents must not present current predictions as validated assessment scores.
-
-## Repository Layout
-
-- `models/`: HuBERT encoder, ASR aligner, scoring heads
-- `utils/`: preprocessing, alignment, pooling, prosody, fusion
-- `inference/`: predictor, CLI infer script, FastAPI app, local test script
-- `audio/`: sample native/learner wav files
-- `config/`: currently empty
-
-## Run Commands
-
-CLI inference:
+### Start the server
 
 ```bash
-python -m inference.infer --wav "audio/learner/01_learner.wav" --lang en
+# Install deps once
+pip install -r requirements.txt
+
+# Run (set checkpoint path)
+CHECKPOINT_PATH=ckpt_hubert_multitask/best.pt uvicorn inference.api:app --host 0.0.0.0 --port 8000
 ```
 
-FastAPI server:
-
-```bash
+Windows PowerShell:
+```powershell
+$env:CHECKPOINT_PATH="ckpt_hubert_multitask/best.pt"
 uvicorn inference.api:app --host 0.0.0.0 --port 8000
 ```
 
-Example request behavior:
-
-- `POST /score` with uploaded wav
-- optional query param: `language=en`
-
-## Dependencies
-
-From `requirements.txt`:
-
-- `numpy`, `scipy`
-- `torch`, `torchaudio`, `transformers`
-- `soundfile`, `webrtcvad`
-- `faster-whisper`
-- `fastapi`, `uvicorn`, `pydantic`
-
-`pyworld` is optional in code (not pinned in requirements).
-
-
-## Data Representation (Training Sample)
-
-Use the following structure as the canonical sample-level representation for dataset rows:
-
-- Utterance-level fields:
-  - `accuracy` (int)
-  - `completeness` (float)
-  - `fluency` (int)
-  - `prosodic` (int)
-  - `total` (int)
-  - `text` (str)
-  - `speaker` (str)
-  - `gender` (str)
-  - `age` (int)
-- `words` (list[dict]), each item includes:
-  - `text` (str)
-  - `accuracy` (int)
-  - `stress` (int)
-  - `total` (int)
-  - `phones` (list[str])
-  - `phones-accuracy` (list[float])
-  - `mispronunciations` (list)
-- `audio` (dict):
-  - `path` (str)
-  - `bytes` (bytes)
-
-Example shape:
+### Call from your web backend
 
 ```python
+import httpx
+
+with open("user_recording.wav", "rb") as f:
+    response = httpx.post(
+        "http://localhost:8000/score",
+        files={"file": ("audio.wav", f, "audio/wav")},
+        params={"language": "en"},
+    )
+result = response.json()
+print(result["total"])     # 0–10
+print(result["text"])      # transcript
+```
+
+### Call from JavaScript / fetch
+
+```js
+const formData = new FormData();
+formData.append("file", audioBlob, "audio.wav");
+
+const res = await fetch("http://localhost:8000/score?language=en", {
+  method: "POST",
+  body: formData,
+});
+const result = await res.json();
+console.log(result.total, result.text);
+```
+
+### Interactive API docs
+
+Visit `http://localhost:8000/docs` to test the endpoint in the browser.
+
+---
+
+## Option B — Import `PronunciationPredictor` directly (Python backend)
+
+Use this when your backend is already Python (Django, Flask, FastAPI, etc.) and you want to embed the scorer in-process.
+
+```python
+from inference.predictor import PronunciationPredictor, PredictorConfig
+
+# Create once at startup — loading is slow (~10–20 s)
+predictor = PronunciationPredictor(PredictorConfig(
+    checkpoint_path = "ckpt_hubert_multitask/best.pt",
+    device          = "cuda",       # "cpu" if no GPU
+    whisper_size    = "small",      # "tiny" for speed, "medium" for accuracy
+    whisper_device  = "cuda",
+    language        = "en",
+))
+
+# Call per request — fast (~0.5–2 s on GPU)
+result = predictor.predict("path/to/uploaded.wav", language="en")
+```
+
+**Important:** Instantiate `PronunciationPredictor` once (e.g. at app startup or as a module-level singleton). Each instantiation loads HuBERT and Whisper from disk.
+
+---
+
+## Output schema reference
+
+```json
 {
-    'accuracy': 8,
-    'completeness': 10.0,
-    'fluency': 9,
-    'prosodic': 9,
-    'text': 'WE CALL IT BEAR',
-    'total': 8,
-    'words': [
-        {
-            'accuracy': 10,
-            'phones': ['W', 'IY0'],
-            'phones-accuracy': [2.0, 2.0],
-            'stress': 10,
-            'text': 'WE',
-            'total': 10,
-            'mispronunciations': []
-        }
-    ],
-    'speaker': '0001',
-    'gender': 'm',
-    'age': 6,
-    'audio': {'bytes': b'...', 'path': '000010011.wav'}
+  "accuracy":     8.2,
+  "completeness": 9.0,
+  "fluency":      7.5,
+  "prosodic":     7.8,
+  "total":        8.1,
+
+  "text": "she sells sea shells",
+
+  "words": [
+    {
+      "text":              "she",
+      "start":             0.12,
+      "end":               0.40,
+      "asr_prob":          0.97,
+      "accuracy":          null,
+      "total":             null,
+      "stress":            null,
+      "phones":            [],
+      "phones-accuracy":   [],
+      "mispronunciations": []
+    }
+  ],
+
+  "audio": {
+    "path": "path/to/audio.wav"
+  },
+
+  "inference_metadata": {
+    "language":    "en",
+    "duration":    2.4,
+    "frame_hz":    50,
+    "prosody_features": {
+      "f0_mean":       180.3,
+      "f0_std":        40.1,
+      "speaking_rate": 4.1,
+      "energy_mean":   0.05,
+      "pause_ratio":   0.12
+    },
+    "scoring_validity": "trained:ckpt_hubert_multitask/best.pt"
+  }
 }
 ```
 
-## Agent Guidelines For This Repo
+### Score interpretation
 
-1. Keep changes modular
-- Put model components in `models/`
-- Put signal/feature helpers in `utils/`
-- Keep orchestration in `inference/`
+| Score        | Meaning                                      |
+|--------------|----------------------------------------------|
+| `total`      | Overall pronunciation quality (0–10)         |
+| `accuracy`   | Phonemic correctness                         |
+| `completeness` | How completely the sentence was said       |
+| `fluency`    | Speaking smoothness and pace                 |
+| `prosodic`   | Pitch, rhythm, stress patterns               |
 
-2. Preserve I/O contracts
-- `predict()` should continue returning the current output schema unless explicitly changed
-- If schema changes, update CLI/API and docs together
+Scores follow the SpeechOcean762 annotation scale (0–10, higher is better).
 
-3. Be explicit about scoring validity
-- If untrained weights are used, document this in code comments and README/AGENTS updates
-- If adding checkpoint support, validate load path and device mapping
+---
 
-4. Prefer CPU-safe defaults
-- Current defaults are CPU-friendly (`device="cpu"`, Whisper `int8`)
-- Keep defaults stable unless the user requests GPU-first behavior
+## Audio requirements
 
-5. Add minimal tests when changing behavior
-- Validate preprocessing shape/range assumptions
-- Validate mapping from seconds to frame indices
-- Validate fused score clamping `[0,100]`
+| Property    | Required value                        |
+|-------------|---------------------------------------|
+| Format      | WAV (PCM), MP3, FLAC — anything soundfile reads |
+| Sample rate | Any — resampled to 16 kHz internally  |
+| Channels    | Mono or stereo — mixed to mono internally |
+| Duration    | 1–30 s recommended                    |
 
-6. Avoid speculative docs
-- Document only what exists in this repository
-- Mark proposed features as future work
+The pipeline applies VAD (Voice Activity Detection) to strip silence automatically.
 
-## Suggested Next Extension
+---
 
-If you implement training next, add:
+## Performance notes
 
-- dataset definition and label format
-- training loop and loss definitions
-- checkpoint save/load
-- evaluator metrics (MAE/RMSE/Pearson/Spearman)
-- config files under `config/`
+| Setting                 | Latency (RTX 4050) | Latency (CPU only) |
+|-------------------------|--------------------|--------------------|
+| `whisper_size="tiny"`   | ~0.4 s             | ~2–4 s             |
+| `whisper_size="small"`  | ~0.8 s             | ~4–8 s             |
+| `whisper_size="medium"` | ~1.5 s             | ~10–20 s           |
+
+- First call after startup is slower (model JIT warm-up).
+- For a web API, keep the predictor alive across requests (do not recreate per request).
+
+---
+
+## Environment variables (for the FastAPI server)
+
+| Variable          | Default | Description                           |
+|-------------------|---------|---------------------------------------|
+| `CHECKPOINT_PATH` | `None`  | Path to `best.pt` — required for real scores |
+
+---
+
+## Key files to know
+
+| File                        | What it does                                          |
+|-----------------------------|-------------------------------------------------------|
+| `inference/api.py`          | FastAPI app — single POST `/score` endpoint           |
+| `inference/predictor.py`    | `PronunciationPredictor` — the core scoring class     |
+| `inference/infer.py`        | CLI entry point                                       |
+| `models/hubert_multitask.py`| Model architecture (HuBERT + scoring heads)           |
+| `notebook_infer/pipeline.py`| `score_file()` / `score_array()` for notebooks/demos |
+
+---
+
+## Common integration patterns
+
+### Django / Flask — singleton predictor
+
+```python
+# myapp/scoring.py
+from inference.predictor import PronunciationPredictor, PredictorConfig
+
+_predictor = None
+
+def get_predictor():
+    global _predictor
+    if _predictor is None:
+        _predictor = PronunciationPredictor(PredictorConfig(
+            checkpoint_path="ckpt_hubert_multitask/best.pt",
+            device="cuda",
+        ))
+    return _predictor
+```
+
+```python
+# myapp/views.py
+from .scoring import get_predictor
+
+def score_view(request):
+    audio_file = request.FILES["audio"]
+    # save to temp file, then:
+    result = get_predictor().predict(tmp_path, language="en")
+    return JsonResponse(result)
+```
+
+### Scoring from a bytes buffer (no disk write)
+
+```python
+import numpy as np, soundfile as sf, io
+
+audio_bytes: bytes = ...  # raw wav bytes from upload
+audio, sr = sf.read(io.BytesIO(audio_bytes))
+audio = audio.astype(np.float32)
+if audio.ndim == 2:
+    audio = audio.mean(axis=1)  # stereo → mono
+
+from notebook_infer.pipeline import score_array, ScoreConfig
+result = score_array(audio, sr, predictor, ScoreConfig())
+```

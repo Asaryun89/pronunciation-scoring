@@ -10,23 +10,32 @@ __pycache__/
 venv/
 ENV/
 
-# PyTorch / checkpoints
+# PyTorch checkpoints — download separately, never commit large binaries
 checkpoints/
+ckpt_*/
 *.pt
 *.pth
+*.bin
 
-# Logs
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs & run artifacts
 *.log
+runs/
+outputs/
 
-# Data / artifacts
+# Data / audio — too large for git; provide your own samples
 data/*
 !data/.gitkeep
 audio/*
+!audio/.gitkeep
 
 # OS
 .DS_Store
 Thumbs.db
 
-# IDE
+# IDE / tools
 .vscode/
 .idea/
+.claude/
