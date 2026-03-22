@@ -1,259 +1,122 @@
-# English Pronunciation Scoring System
+# English Pronunciation Scoring
 
-A modular pronunciation scoring pipeline built on self-supervised speech representations. The system combines HuBERT embeddings, lightweight ASR alignment, and multi-head scoring to evaluate pronunciation at phoneme, word, and utterance levels.
+End-to-end pronunciation scoring pipeline trained on [SpeechOcean762](https://huggingface.co/datasets/mispeech/speechocean762).
+Combines a layer-weighted HuBERT encoder, a frozen Qwen3 text encoder, cross-attention fusion, and a deep MLP scoring head to predict five utterance-level pronunciation dimensions.
 
-## Overview
+## Architecture
 
-The project is designed for both research and production-style deployment, with focus on:
-
-- Pronunciation accuracy scoring
-- Prosody and fluency modeling
-- Error localization for actionable learner feedback
-- Structured output for downstream applications
-
-## Objectives
-
-- Evaluate learner pronunciation using deep contextual speech representations
-- Provide phoneme-level and word-level error localization
-- Generate an overall pronunciation score (0-100)
-- Model prosody, fluency, and rhythm
-- Produce structured feedback output for user-facing applications
-
-## Core Components
-
-### 1. HuBERT Encoder
-
-A self-supervised Transformer-based model that extracts rich acoustic representations from raw waveform input.
-
-- Input: 16 kHz waveform
-- Output: frame-level embeddings with shape `[T x D]`
-
-Where:
-
-- `T`: number of time frames
-- `D`: embedding dimension per frame
-
-HuBERT captures:
-
-- Phonetic structure
-- Coarticulation effects
-- Accent variation
-- Prosody and rhythm
-- Temporal dependencies
-
-### 2. Lightweight ASR Alignment Model
-
-Provides temporal segmentation of words and phonemes.
-
-- Purpose: alignment only (not scoring)
-- Typical options:
-  - Small CTC-based ASR
-  - Whisper-tiny
-  - Distilled wav2vec2
-
-Outputs:
-
-- Transcript
-- Word timestamps
-- Optional phoneme timestamps
-
-Example:
-
-```text
-Input speech: "She sells sea shells"
-
-ASR output:
-{
-  "transcript": "She sells sea shells",
-  "word_timestamps_sec": [
-    {"word": "She", "start": 0.12, "end": 0.40},
-    {"word": "sells", "start": 0.41, "end": 0.80},
-    {"word": "sea", "start": 0.81, "end": 1.05},
-    {"word": "shells", "start": 1.06, "end": 1.45}
-  ]
-}
-```
-
-### 3. Alignment Mapping
-
-Maps HuBERT frame embeddings to linguistic segments.
-
-Each segment looks like:
+![Model Architecture](docs/model_architect.png)
 
 ```
-frames 0–120   → "She"
-frames 121–300 → "sells"
-frames 301–410 → "sea"
-frames 411–580 → "shells"
+Raw audio (any SR)
+  └─ preprocess_wav()  →  resample 16 kHz · VAD trim · zero-mean/unit-std
+       │
+       ▼  Audio path
+  HuBERT (facebook/hubert-base-ls960)
+    13 hidden states  →  learnable layer-weighted sum  →  (T, 768)
+    Linear(768, 256)                                   →  (T, 256)
+    TransformerEncoder ×1  (pre-LN, pre-fusion)        →  (T, 256)
+       │
+       │  Text path (parallel)
+       │  Faster-Whisper ASR  →  transcript
+       │  Qwen3-Embedding-0.6B  →  mask-aware mean pool  →  (1024,)
+       │  Linear(1024, 256) + LayerNorm                  →  (1, 256)  [K/V]
+       │
+       ▼
+  CrossAttentionFusion  (Audio Q · Text K/V)           →  (T, 256)
+  TransformerEncoder ×2  (pre-LN, post-fusion)         →  (T, 256)
+  mean(dim=1)                                          →  (256,)
+       │
+       ├─ MLPScoringHead  →  Sigmoid × 5  →  [0,1]  →  ×10  →  [0,10]
 ```
 
-For each segment:
+**Output dimensions** (SpeechOcean scale 0–10):
 
-```text
-z_segment = Pool(E[t_start:t_end])
-```
+| Dimension | Description |
+|-----------|-------------|
+| `total` | Overall pronunciation quality |
+| `accuracy` | Phonetic accuracy |
+| `fluency` | Speech fluency and naturalness |
+| `prosodic` | Prosody, rhythm, and stress |
+| `completeness` | Utterance completeness |
 
-Where:
+## Results
 
-- `E` = HuBERT frame embeddings
-- `Pool` = mean pooling or attention pooling
+Trained on `mispeech/speechocean762` train split, evaluated on test split.
+Best checkpoint at epoch 10 (selected by `pearson_total`).
 
-### 4. Multi-Head Neural Scoring Network
+### Utterance-level Pearson correlation (PCC ↑) on SpeechOcean762
 
-Predicts pronunciation quality at multiple granularities.
+| Model | total | accuracy | fluency | prosodic |
+|-------|------:|--------:|--------:|--------:|
+| HuBERT Base + BLSTM *(Kim et al., 2022)* | — | — | 0.74 | 0.73 |
+| **HuBERT Large + BLSTM** *(Kim et al., 2022)* | — | — | **0.78** | **0.77** |
+| HierTFR *(Yan et al., ACL 2024)* | 0.764 | 0.735 | 0.801 | 0.795 |
+| **Ours** (HuBERT-base + Qwen3 + CrossAttn) | 0.740 | 0.714 | 0.792 | 0.791 |
 
-- Phoneme head
-  - Input: phoneme embedding
-  - Output: score in `[0, 1]`
-- Word head
-  - Input: aggregated phoneme embeddings
-  - Output: score in `[0, 1]`
-- Utterance head
-  - Input: global embedding
-  - Output: overall score `(0-100)`
-- Prosody head
-  - Inputs: pitch (F0 statistics), energy contour, speaking rate, pause duration
-  - Outputs: fluency score, rhythm score, intonation score
+> Kim et al. (2022) report only fluency and prosodic for SpeechOcean762.
+> HierTFR uses HuBERT Large + a hierarchical Transformer trained with phone/word/utterance supervision.
+> Our model uses HuBERT Base (smaller backbone) with a single utterance-level MLP head and no phone-level labels.
 
-## Pronunciation Grading Outputs
+### Full metrics (this work)
 
-- Phoneme-level scores
-- Word-level scores
-- Utterance-level overall score
-- Prosody and fluency evaluation
-- Structured feedback output
+| Metric | total | accuracy | fluency | prosodic |
+|--------|------:|--------:|--------:|--------:|
+| Pearson r | 0.740 | 0.714 | 0.792 | 0.791 |
+| Spearman ρ | 0.745 | 0.705 | 0.796 | 0.795 |
+| MAE (÷10) | 0.079 | 0.084 | 0.068 | 0.068 |
 
-## Feature Highlights
+> `completeness` is excluded from training loss — SpeechOcean learners score 10/10 almost universally, which collapses the head to a constant predictor.
 
-- HuBERT encoder for acoustic representation (act as feature extraction, conduct to utterance evaluation)
-- Lightweight ASR for word/phoneme alignment (get timestamps for word/phoneme/sentence)
-- Multi-head neural scoring network
-- Error localization (mispronounced words/segments)
+![Validation Metrics](docs/metrics.png)
 
-## Dataset Preparation
+![Training Loss](docs/loss.png)
 
-Reference speech:
+### Model statistics
 
-- 10-20 English sentences
-- Spoken by native speakers
-- Clean recordings (16 kHz, mono WAV)
+![Model Statistics](docs/models_statistics.png)
 
-Learner speech:
+![Model Info](docs/models_info.png)
 
-- Same sentence set as reference
-- Spoken by Vietnamese learners
-- Recorded under similar acoustic conditions
+## Quick Start
 
-## System Workflow
-
-```text
-                           ┌───────────────────────────┐
-                           │        Audio Input        │
-                           │   (16 kHz mono waveform)  │
-                           └─────────────┬─────────────┘
-                                         │
-                                         ▼
-                        ┌────────────────────────────────┐
-                        │  Preprocessing Module          │
-                        │  - Voice Activity Detection    │
-                        │  - Silence trimming            │
-                        │  - Optional denoising          │
-                        └────────────────┬───────────────┘
-                                         │
-                                         ▼
-        ┌────────────────────────────────────────────────────────────┐
-        │                    Parallel Processing                     │
-        └────────────────────────────────────────────────────────────┘
-                 │                                            │
-                 ▼                                            ▼
-     ┌─────────────────────────┐                 ┌─────────────────────────┐
-     │   HuBERT Encoder        │                 │  Lightweight ASR Model  │
-     │  (Self-Supervised SSL)  │                 │  (CTC / Whisper-tiny)   │
-     │                         │                 │                         │
-     │ Output: Frame-level     │                 │ Output: Transcript +    │
-     │ embeddings [T × D]      │                 │ Word/Phone timestamps   │
-     └─────────────┬───────────┘                 └─────────────┬───────────┘
-                   │                                           │
-                   └────────────────────┬──────────────────────┘
-                                        ▼
-                        ┌────────────────────────────────┐
-                        │  Alignment Mapping Module      │
-                        │  - Map frames to segments      │
-                        │  - Build segment frame ranges  │
-                        └────────────────┬───────────────┘
-                                         │
-                                         ▼
-                        ┌────────────────────────────────┐
-                        │  Segment Pooling Module        │
-                        │  - Mean/Attention pooling      │
-                        │  - Produce segment vectors     │
-                        └────────────────┬───────────────┘
-                                         │
-                                         ▼
-              ┌────────────────────────────────────────────────┐
-              │            Multi-Head Scoring Network          │
-              │  - Phoneme Scoring Head (0–1)                  │
-              │  - Word Scoring Head (0–1)                     │
-              │  - Utterance Scoring Head (0–100)              │
-              │  - Prosody Scoring Head                        │
-              └────────────────┬───────────────────────────────┘
-                               │
-                               ▼
-              ┌────────────────────────────────────────────────┐
-              │          Score Fusion & Calibration            │
-              │  Combine accuracy + fluency + prosody          │
-              └────────────────┬───────────────────────────────┘
-                               │
-                               ▼
-              ┌────────────────────────────────────────────────┐
-              │            Feedback Generation Module          │
-              │  - Highlight low-score words                   │
-              │  - Detect mispronounced phonemes               │
-              │  - Generate structured JSON output             │
-              └────────────────────────────────────────────────┘
-```
-
-## Run Inference 
+### Training
 
 ```bash
-python -m inference.infer --wav "path/to/audio.wav" --lang en
+python models/train.py \
+  --dataset mispeech/speechocean762 \
+  --epochs 100 \
+  --batch_size 4 \
+  --lr 2e-5 \
+  --out_dir ckpt_hubert_multitask
 ```
 
-## HuBERT Embedding Example
+Key training arguments:
 
-```python
-from utils.preprocessing import preprocess_wav
-from models.hubert_encoder import HubertEncoder, HubertConfig
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--epochs` | 5 | Number of training epochs |
+| `--batch_size` | 4 | Batch size |
+| `--lr` | 2e-5 | AdamW learning rate |
+| `--d_model` | 256 | Shared projection dimension |
+| `--num_heads` | 8 | Attention heads |
+| `--num_audio_transformer_layers` | 1 | Pre-fusion self-attention depth |
+| `--num_transformer_layers` | 2 | Post-fusion Transformer depth |
+| `--mlp_hidden_layers` | 2 | MLP hidden blocks |
+| `--num_unfreeze_hubert_layers` | 12 | HuBERT backbone layers to unfreeze (12 = full) |
+| `--w_pfeat` | 0.0 | Auxiliary prosody loss weight (0 = disabled) |
+| `--patience` | 3 | Early stopping on `pearson_total` |
+| `--text_model` | `Qwen/Qwen3-Embedding-0.6B` | Text encoder (empty string to disable) |
+| `--no_freeze_text` | — | Fine-tune text encoder (frozen by default) |
 
-wav_path = "data/learner/01_learner.wav"
-audio, sr = preprocess_wav(wav_path, target_sr=16000, use_vad=True)
+Best checkpoint is saved to `{out_dir}/best.pt` (selected by `pearson_total`).
+Training metrics are logged to `{out_dir}/result.csv`.
 
-encoder = HubertEncoder(HubertConfig(
-    model_name="facebook/hubert-base-ls960",
-    device="cpu",
-))
+### CLI Inference
 
-emb, frame_hz = encoder.encode(audio, sr=sr)
-print("Embedding shape:", emb.shape)  # (T, D)
-print("Frame rate (Hz):", frame_hz)
-```
-
-## Whisper ASR Alignment Example
-
-```python
-from utils.preprocessing import preprocess_wav
-from models.asr_aligner import ASRAligner, ASRConfig
-
-wav_path = "data/learner/01_learner.wav"
-audio, sr = preprocess_wav(wav_path, target_sr=16000, use_vad=True)
-
-aligner = ASRAligner(ASRConfig(
-    model_size="small",
-    device="cpu",
-    compute_type="int8",
-))
-
-asr = aligner.transcribe_with_timestamps(audio, sr=sr, language="en")
-print("Text:", asr["text"])
-print("Words:", asr["words"][:5])  # first 5 timestamped words
+```bash
+python -m inference.infer \
+  --wav data/learner/01_learner.wav \
+  --checkpoint ckpt_hubert_multitask/best.pt \
+  --lang en
 ```

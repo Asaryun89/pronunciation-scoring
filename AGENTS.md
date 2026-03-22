@@ -87,8 +87,7 @@ Key functions:
 `MultiHeadScorer` contains:
 
 - `word_head`: outputs `[0,1]` via sigmoid
-- `utt_head`: outputs `[0,100]` via sigmoid * 100
-- `prosody_head`: outputs `[0,1]` via sigmoid
+- `sentence_head`: outputs `[0,100]` for `completeness`, `fluency`, `prosodic`, and `total`
 
 ### 8) Final Score Fusion (`utils/fusion.py`)
 
@@ -104,48 +103,86 @@ Default weights:
 
 ## Inference Flow
 
-Implemented in `inference/predictor.py`:
+Implemented in `inference/predictor.py` using the unified `HubertMultiTask` model:
 
-1. Preprocess wav
-2. Encode HuBERT embeddings
-3. ASR word timestamps
-4. Map words to HuBERT frame spans
-5. Pool word embeddings + utterance embedding
-6. Extract prosody vector
-7. Run multi-head scorer
-8. Fuse scores
-9. Return structured JSON
+1. Preprocess wav (resample → VAD → normalize)
+2. Wav2Vec2FeatureExtractor → `input_values` tensor
+3. Faster-Whisper → word timestamps
+4. `HubertMultiTask.forward_inference()`:
+   - HuBERT hidden states `(1, T, 768)`
+   - Estimate `frame_hz = T / duration`
+   - ASR-aligned frame spans via `build_word_segments()`
+   - Sentence: mean pool → `sentence_head` → sigmoid → `[0,1]`
+   - Words: per-span mean pool → `word_head` → sigmoid → `[0,1]`
+5. Scale all scores `× 10` → `[0, 10]` (SpeechOcean native scale)
+6. Extract prosody features (audio-computed, stored in metadata)
+7. Return dataset-shaped structured JSON
 
 Output keys:
 
-- `text`
-- `overall_score`
-- `accuracy`
-- `fluency`
-- `prosody`
-- `prosody_features`
-- `words` (with per-word score)
+- `accuracy`, `completeness`, `fluency`, `prosodic`, `total` — utterance scores `[0, 10]`
+- `text` — ASR transcript
+- `words` — per-word: `text`, `accuracy`, `total`, `start`, `end`, `asr_prob`
+- `audio` — `path`
+- `inference_metadata` — `language`, `duration`, `frame_hz`, `prosody_features`, `scoring_validity`
 
-## Important Current Limitation
+## Scoring Validity
 
-The scorer in `PronunciationPredictor` is **randomly initialized** on first use and set to eval mode.
+`inference_metadata.scoring_validity` reflects the checkpoint state:
 
-- There is currently **no checkpoint loading** in `inference/predictor.py`
-- Scores are not meaningful for production until trained weights are added
+- `"untrained_random_init"` — no checkpoint loaded; scores are meaningless
+- `"trained:<path>"` — loaded from a trained checkpoint; scores are meaningful
 
-Agents must not present current predictions as validated assessment scores.
+Load a checkpoint via `PredictorConfig(checkpoint_path="ckpt_hubert_multitask/best.pt")`.
+
+## Unified Model Architecture (`models/train.py` → `HubertMultiTask`)
+
+All four heads predict `[0, 1]` via sigmoid. Multiply by scale to display:
+
+| Head | Output | Scale | Trained on |
+|---|---|---|---|
+| `sentence_head` | 5 scalars | ×10 | `total, accuracy, fluency, prosodic, completeness` |
+| `prosody_feat_head` | 5 scalars | raw | `rms, zcr, peak_rate, f0_mean, f0_std` |
+| `word_head` | 1 per word | ×10 | `words[].total` |
+| `phone_head` | 1 per phone | ×2 | `words[].phones-accuracy` |
+
+Score dimension order constant: `SENT_DIMS = ["total", "accuracy", "fluency", "prosodic", "completeness"]`
+
+Word segmentation: even frame splits during training; ASR-aligned spans at inference.
 
 ## Repository Layout
 
-- `models/`: HuBERT encoder, ASR aligner, scoring heads
-- `utils/`: preprocessing, alignment, pooling, prosody, fusion
-- `inference/`: predictor, CLI infer script, FastAPI app, local test script
-- `audio/`: sample native/learner wav files
-- `config/`: currently empty
+- `models/train.py` — `HubertMultiTask` (unified train+inference model), `Collator`, `compute_loss`, `eval_epoch`, `main()`
+- `models/asr_aligner.py` — Faster-Whisper word timestamps
+- `models/hubert_encoder.py` — standalone HuBERT encoder (retained for compatibility)
+- `models/scoring_heads.py` — `MultiHeadScorer` (superseded by `HubertMultiTask`; retained for reference)
+- `utils/` — preprocessing, alignment, pooling, prosody, fusion
+- `inference/` — `predictor.py`, `infer.py` (CLI), `api.py` (FastAPI)
+- `audio/` — sample wav files
+- `config/` — currently empty
 
 ## Run Commands
 
-CLI inference:
+Training on SpeechOcean762:
+
+```bash
+python models/train.py \
+  --dataset mispeech/speechocean762 \
+  --epochs 10 \
+  --batch_size 4 \
+  --out_dir ckpt_hubert_multitask
+```
+
+CLI inference (with trained checkpoint):
+
+```bash
+python -m inference.infer \
+  --wav "audio/learner/01_learner.wav" \
+  --lang en \
+  --checkpoint ckpt_hubert_multitask/best.pt
+```
+
+CLI inference (random weights, for pipeline testing):
 
 ```bash
 python -m inference.infer --wav "audio/learner/01_learner.wav" --lang en
@@ -154,6 +191,7 @@ python -m inference.infer --wav "audio/learner/01_learner.wav" --lang en
 FastAPI server:
 
 ```bash
+CHECKPOINT_PATH=ckpt_hubert_multitask/best.pt \
 uvicorn inference.api:app --host 0.0.0.0 --port 8000
 ```
 
@@ -228,6 +266,28 @@ Example shape:
     'audio': {'bytes': b'...', 'path': '000010011.wav'}
 }
 ```
+
+## Dataset Inspection Notes
+
+The notebook [data/data_inspection.ipynb](/mnt/d/pronunciation_scoring/data/data_inspection.ipynb) is the current inspection entrypoint for the Hugging Face dataset used in training preparation:
+
+- Loads `mispeech/speechocean762` with `load_dataset(...)`
+- Casts the `audio` column to `Audio(decode=False)` before row inspection
+- Prints split sizes, feature schema, sample keys, utterance-level fields, first word annotation, and audio metadata
+
+This `decode=False` step is intentional:
+
+- it avoids `torchcodec` / FFmpeg runtime failures during dataset inspection
+- it preserves file/path metadata needed for schema review before training collation
+
+For training preparation, treat the inspected dataset annotation as:
+
+- utterance labels: `accuracy`, `completeness`, `fluency`, `prosodic`, `total`
+- utterance metadata: `text`, `speaker`, `gender`, `age`
+- word annotations: `text`, `accuracy`, `stress`, `total`, `phones`, `phones-accuracy`, `mispronunciations`
+- audio metadata payload: at minimum `path`, and optionally `bytes` or decoded array data depending on loader settings
+
+The validation and collation logic in `models/train.py` should stay aligned with this inspected schema.
 
 ## Agent Guidelines For This Repo
 

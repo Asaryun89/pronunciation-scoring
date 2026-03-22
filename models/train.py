@@ -1,33 +1,47 @@
-# train_hubert_speechocean_hf.py
-# pip install torch torchaudio transformers datasets accelerate
+# Fine-tune HuBERT on SpeechOcean762 for utterance-level pronunciation scoring.
+# Produces sentence-level scores only (total, accuracy, fluency, prosodic, completeness).
+# Word and phone prediction heads are intentionally omitted — to be trained separately.
+# pip install torch torchaudio transformers datasets accelerate scipy
 
+import csv
 import os
-import math
-import io
+import sys
 import argparse
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-import soundfile as sf
-from scipy.signal import resample_poly
+from torch.optim.lr_scheduler import LambdaLR
+from scipy.stats import pearsonr, spearmanr
 
 from datasets import load_dataset, Audio
-from transformers import HubertModel, Wav2Vec2FeatureExtractor
+from transformers import AutoTokenizer
+
 try:
     from accelerate import Accelerator  # type: ignore
 except Exception:
     Accelerator = None
 
+# ---------------------------------------------------------------------------
+# Path fix — support both `python models/train.py` and `python -m models.train`
+# ---------------------------------------------------------------------------
+_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _root not in sys.path:
+    sys.path.insert(0, _root)
 
+from models.constants import SENT_DIMS, PROSODY_DIMS, ACTIVE_SENT_IDXS  # noqa: E402
+from models.hubert_multitask import HubertMultiTask                             # noqa: E402
+from data.collate import Collator                                                # noqa: E402
+from data.validate import validate_example_schema                               # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Accelerator shim — single-process fallback when `accelerate` is not installed
+# ---------------------------------------------------------------------------
 class SimpleAccelerator:
-    """
-    Minimal fallback used when `accelerate` is not installed.
-    Supports single-process CPU/GPU training.
-    """
     def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.is_main_process = True
@@ -37,6 +51,8 @@ class SimpleAccelerator:
         for obj in args:
             if isinstance(obj, nn.Module):
                 prepared.append(obj.to(self.device))
+            elif obj is None:
+                prepared.append(None)
             else:
                 prepared.append(obj)
         return tuple(prepared)
@@ -59,443 +75,180 @@ def create_accelerator():
 
 
 def move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
-    moved = {}
-    for k, v in batch.items():
-        if torch.is_tensor(v):
-            moved[k] = v.to(device)
-        else:
-            moved[k] = v
-    return moved
+    return {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
 
 
-# -------------------------
-# Helpers
-# -------------------------
 def set_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
-def safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
+def make_warmup_scheduler(optimizer: torch.optim.Optimizer, warmup_steps: int) -> LambdaLR:
+    def lr_lambda(step: int) -> float:
+        if warmup_steps <= 0 or step >= warmup_steps:
+            return 1.0
+        return float(step) / float(max(1, warmup_steps))
+    return LambdaLR(optimizer, lr_lambda)
 
 
-def strict_float(x: Any, field_name: str, row_hint: str) -> float:
-    try:
-        v = float(x)
-    except Exception as exc:
-        raise ValueError(f"{row_hint}: field `{field_name}` must be numeric, got {type(x).__name__}") from exc
-    if not math.isfinite(v):
-        raise ValueError(f"{row_hint}: field `{field_name}` must be finite, got {v}")
-    return v
-
-
-def require_field(obj: Dict[str, Any], key: str, row_hint: str) -> Any:
-    if key not in obj:
-        raise ValueError(f"{row_hint}: missing required field `{key}`")
-    return obj[key]
-
-
-def build_row_hint(example: Dict[str, Any], split_name: str, index: Any) -> str:
-    audio = example.get("audio", {}) if isinstance(example.get("audio", {}), dict) else {}
-    audio_path = audio.get("path", "unknown_path")
-    speaker = example.get("speaker", "unknown_speaker")
-    text = str(example.get("text", ""))[:40]
-    return f"[{split_name} idx={index} speaker={speaker} audio={audio_path} text={text!r}]"
-
-
-def validate_example_schema(example: Dict[str, Any], split_name: str, index: Any) -> None:
-    row_hint = build_row_hint(example, split_name, index)
-
-    # Required utterance-level fields from AGENTS.md schema
-    strict_float(require_field(example, "accuracy", row_hint), "accuracy", row_hint)
-    strict_float(require_field(example, "completeness", row_hint), "completeness", row_hint)
-    strict_float(require_field(example, "fluency", row_hint), "fluency", row_hint)
-    strict_float(require_field(example, "prosodic", row_hint), "prosodic", row_hint)
-    strict_float(require_field(example, "total", row_hint), "total", row_hint)
-    require_field(example, "text", row_hint)
-    require_field(example, "speaker", row_hint)
-    require_field(example, "gender", row_hint)
-    strict_float(require_field(example, "age", row_hint), "age", row_hint)
-
-    audio = require_field(example, "audio", row_hint)
-    if not isinstance(audio, dict):
-        raise ValueError(f"{row_hint}: field `audio` must be a dict")
-    require_field(audio, "path", row_hint)
-    if ("array" not in audio) and ("bytes" not in audio):
-        raise ValueError(f"{row_hint}: audio must include either `array` or `bytes`")
-
-    words = require_field(example, "words", row_hint)
-    if not isinstance(words, list):
-        raise ValueError(f"{row_hint}: field `words` must be a list")
-    for wi, w in enumerate(words):
-        if not isinstance(w, dict):
-            raise ValueError(f"{row_hint}: words[{wi}] must be a dict")
-        strict_float(require_field(w, "accuracy", row_hint), f"words[{wi}].accuracy", row_hint)
-        strict_float(require_field(w, "stress", row_hint), f"words[{wi}].stress", row_hint)
-        strict_float(require_field(w, "total", row_hint), f"words[{wi}].total", row_hint)
-        require_field(w, "text", row_hint)
-        phones = require_field(w, "phones", row_hint)
-        phone_acc = require_field(w, "phones-accuracy", row_hint)
-        require_field(w, "mispronunciations", row_hint)
-        if not isinstance(phones, list):
-            raise ValueError(f"{row_hint}: words[{wi}].phones must be a list")
-        if not isinstance(phone_acc, list):
-            raise ValueError(f"{row_hint}: words[{wi}].phones-accuracy must be a list")
-        for pi, v in enumerate(phone_acc):
-            strict_float(v, f"words[{wi}].phones-accuracy[{pi}]", row_hint)
-
-
-def build_prosody_features(example: Dict[str, Any], row_hint: str) -> List[float]:
-    """
-    Your dataset does NOT provide `prosody_features` explicitly.
-    So we derive a simple vector from existing annotation fields.
-
-    Vector (K=4):
-      0) prosodic (sentence)
-      1) avg word stress
-      2) avg phone accuracy (across all phones)
-      3) std phone accuracy
-    """
-    prosodic = strict_float(example.get("prosodic"), "prosodic", row_hint)
-    words = example.get("words", [])
-
-    stresses = []
-    phone_accs = []
-    for w in words:
-        stresses.append(strict_float(w.get("stress"), "words[].stress", row_hint))
-        pa = w.get("phones-accuracy", []) or []
-        for v in pa:
-            phone_accs.append(strict_float(v, "words[].phones-accuracy[]", row_hint))
-
-    if len(stresses) == 0:
-        avg_stress = 0.0
-    else:
-        avg_stress = sum(stresses) / len(stresses)
-
-    if len(phone_accs) == 0:
-        mean_pa = 0.0
-        std_pa = 0.0
-    else:
-        mean_pa = sum(phone_accs) / len(phone_accs)
-        var = sum((v - mean_pa) ** 2 for v in phone_accs) / max(1, len(phone_accs))
-        std_pa = math.sqrt(var)
-
-    return [prosodic, avg_stress, mean_pa, std_pa]
-
-
-def _to_mono(audio):
-    if hasattr(audio, "ndim") and audio.ndim == 2:
-        return audio.mean(axis=1)
-    return audio
-
-
-def decode_audio_from_example(example: Dict[str, Any], row_hint: str, target_sr: int = 16000):
-    audio = example.get("audio")
-    if not isinstance(audio, dict):
-        raise ValueError(f"{row_hint}: field `audio` must be a dict")
-
-    if "array" in audio and audio["array"] is not None:
-        arr = _to_mono(audio["array"])
-        sr = int(audio.get("sampling_rate", target_sr))
-    else:
-        a_bytes = audio.get("bytes", None)
-        a_path = audio.get("path", None)
-        if a_bytes is not None:
-            arr, sr = sf.read(io.BytesIO(a_bytes), dtype="float32")
-        elif a_path:
-            arr, sr = sf.read(a_path, dtype="float32")
-        else:
-            raise ValueError(f"{row_hint}: audio needs either `array`, `bytes`, or `path`")
-        arr = _to_mono(arr)
-
-    if sr != target_sr:
-        arr = resample_poly(arr, target_sr, sr)
-    return arr
-
-
-# -------------------------
-# Collator
-# -------------------------
-@dataclass
-class Collator:
-    feature_extractor: Wav2Vec2FeatureExtractor
-    sample_rate: int = 16000
-    max_words: int = 60
-    split_name: str = "unknown"
-
-    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-        # Validate schema and extract audio arrays with row-level hints.
-        audios = []
-        for i, ex in enumerate(batch):
-            row_ref = f"batch_pos:{i}"
-            validate_example_schema(ex, self.split_name, row_ref)
-            row_hint = build_row_hint(ex, self.split_name, row_ref)
-            arr = decode_audio_from_example(ex, row_hint, target_sr=self.sample_rate)
-            audios.append(arr)
-
-        feats = self.feature_extractor(
-            audios,
-            sampling_rate=self.sample_rate,
-            return_tensors="pt",
-            padding=True,
-        )
-        input_values = feats["input_values"]               # (B, Tsamples)
-        attention_mask = feats.get("attention_mask", None) # (B, Tsamples) or None
-
-        # sentence targets: overall(total), accuracy, fluency, prosody(prosodic), completeness
-        sent_targets = []
-        prosody_feats = []
-
-        # word targets: words[i]["total"]
-        Wmax = min(
-            self.max_words,
-            max(len(ex.get("words", []) or []) for ex in batch) if len(batch) else 1,
-        )
-        word_scores = torch.zeros(len(batch), Wmax, dtype=torch.float32)
-        word_mask = torch.zeros(len(batch), Wmax, dtype=torch.bool)
-
-        for i, ex in enumerate(batch):
-            row_ref = f"batch_pos:{i}"
-            row_hint = build_row_hint(ex, self.split_name, row_ref)
-            total = strict_float(ex.get("total"), "total", row_hint)
-            acc = strict_float(ex.get("accuracy"), "accuracy", row_hint)
-            flu = strict_float(ex.get("fluency"), "fluency", row_hint)
-            pro = strict_float(ex.get("prosodic"), "prosodic", row_hint)
-            comp = strict_float(ex.get("completeness"), "completeness", row_hint)
-            sent_targets.append([total, acc, flu, pro, comp])
-
-            pf = build_prosody_features(ex, row_hint)  # K=4
-            prosody_feats.append(pf)
-
-            ws = ex.get("words", []) or []
-            ws = ws[:Wmax]
-            if len(ws) > 0:
-                scores = [strict_float(w.get("total"), f"words[{j}].total", row_hint) for j, w in enumerate(ws)]
-                word_scores[i, :len(scores)] = torch.tensor(scores, dtype=torch.float32)
-                word_mask[i, :len(scores)] = True
-
-        sent_targets = torch.tensor(sent_targets, dtype=torch.float32)      # (B,5)
-        prosody_feats = torch.tensor(prosody_feats, dtype=torch.float32)    # (B,K=4)
-
-        return {
-            "input_values": input_values,
-            "attention_mask": attention_mask,
-            "sent_targets": sent_targets,
-            "prosody_feats": prosody_feats,
-            "word_scores": word_scores,
-            "word_mask": word_mask,
-        }
-
-
-# -------------------------
-# Model
-# -------------------------
-class HubertMultiTask(nn.Module):
-    """
-    Heads:
-      - sentence_head: 5 scalars (total, accuracy, fluency, prosodic, completeness)
-      - prosody_feat_head: K=4 derived features
-      - word_head: per-word scalar, using EVEN frame segmentation baseline
-    """
-    def __init__(self, model_name: str, prosody_feat_dim: int = 4, dropout: float = 0.1, freeze_fe: bool = True):
-        super().__init__()
-        self.hubert = HubertModel.from_pretrained(model_name)
-        if freeze_fe:
-            self.hubert.feature_extractor._freeze_parameters()
-
-        hidden = self.hubert.config.hidden_size
-
-        self.sentence_head = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, 5),
-        )
-
-        self.prosody_feat_head = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, prosody_feat_dim),
-        )
-
-        self.word_head = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, 1),
-        )
-
-    def forward(
-        self,
-        input_values: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-        word_mask: torch.Tensor,  # (B, W)
-    ) -> Dict[str, torch.Tensor]:
-        out = self.hubert(input_values=input_values, attention_mask=attention_mask)
-        hidden = out.last_hidden_state  # (B, Tfrm, H)
-
-        B, Tfrm, H = hidden.shape
-
-        # Sentence embedding: mean over frames (HuBERT already outputs frames)
-        sent_emb = hidden.mean(dim=1)  # (B,H)
-
-        sent_pred = self.sentence_head(sent_emb)          # (B,5)
-        prosody_feat_pred = self.prosody_feat_head(sent_emb)  # (B,K)
-
-        # Word-level baseline: even segmentation across Tfrm into W segments
-        W = word_mask.size(1)
-        word_pred = torch.zeros(B, W, device=hidden.device, dtype=torch.float32)
-
-        for b in range(B):
-            valid_w = int(word_mask[b].sum().item())
-            if valid_w == 0:
-                continue
-            # split frames into valid_w bins
-            # boundaries: [0..Tfrm] into valid_w equal parts
-            for wi in range(valid_w):
-                s = int(round(wi * Tfrm / valid_w))
-                e = int(round((wi + 1) * Tfrm / valid_w))
-                e = max(e, s + 1)
-                seg = hidden[b, s:e, :]  # (segT, H)
-                w_emb = seg.mean(dim=0)  # (H,)
-                word_pred[b, wi] = self.word_head(w_emb).squeeze(-1)
-
-        return {
-            "sent_pred": sent_pred,
-            "prosody_feat_pred": prosody_feat_pred,
-            "word_pred": word_pred,
-        }
-
-
-# -------------------------
-# Loss + Eval
-# -------------------------
+# ---------------------------------------------------------------------------
+# Loss
+# ---------------------------------------------------------------------------
 def compute_loss(
     outputs: Dict[str, torch.Tensor],
-    batch: Dict[str, torch.Tensor],
-    w_sent: float,
+    batch:   Dict[str, Any],
+    w_sent:  float,
     w_pfeat: float,
-    w_words: float,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     device = outputs["sent_pred"].device
-    sent_targets = batch["sent_targets"].to(device)         # (B,5)
-    prosody_feats = batch["prosody_feats"].to(device)       # (B,K)
-    word_scores = batch["word_scores"].to(device)           # (B,W)
-    word_mask = batch["word_mask"].to(device)               # (B,W)
 
-    sent_loss = F.smooth_l1_loss(outputs["sent_pred"], sent_targets)
-    pfeat_loss = F.smooth_l1_loss(outputs["prosody_feat_pred"], prosody_feats)
+    sent_targets  = batch["sent_targets"].to(device)
+    prosody_feats = batch["prosody_feats"].to(device)
 
-    if word_mask.any():
-        wp = outputs["word_pred"][word_mask]
-        wt = word_scores[word_mask]
-        word_loss = F.smooth_l1_loss(wp, wt)
-    else:
-        word_loss = torch.tensor(0.0, device=device)
+    # Only train on active sentence dims — completeness (idx 4) is excluded because
+    # SpeechOcean learners nearly always score 10/10, collapsing the head to a constant.
+    # MSE loss matches the paper (Kim et al., 2022).
+    sent_loss  = F.mse_loss(
+        outputs["sent_pred"][:, ACTIVE_SENT_IDXS],
+        sent_targets[:, ACTIVE_SENT_IDXS],
+    )
+    pfeat_loss = F.mse_loss(outputs["prosody_pred"], prosody_feats)
 
-    total = w_sent * sent_loss + w_pfeat * pfeat_loss + w_words * word_loss
+    total_loss = w_sent * sent_loss + w_pfeat * pfeat_loss
+
     logs = {
-        "loss_total": float(total.detach().cpu()),
-        "loss_sent": float(sent_loss.detach().cpu()),
-        "loss_prosody_feat": float(pfeat_loss.detach().cpu()),
-        "loss_words": float(word_loss.detach().cpu()),
+        "loss_total":   float(total_loss.detach().cpu()),
+        "loss_sent":    float(sent_loss.detach().cpu()),
+        "loss_prosody": float(pfeat_loss.detach().cpu()),
     }
-    return total, logs
+    return total_loss, logs
 
 
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
 @torch.no_grad()
-def eval_epoch(model: nn.Module, loader: DataLoader, accelerator: Any) -> Dict[str, float]:
+def eval_epoch(
+    model:       nn.Module,
+    loader:      DataLoader,
+    accelerator: Any,
+    w_sent:      float = 1.0,
+    w_pfeat:     float = 0.0,
+) -> Dict[str, float]:
     model.eval()
+
+    all_pred:   List[torch.Tensor] = []
+    all_target: List[torch.Tensor] = []
     total_loss = 0.0
-    n_steps = 0
+    n_steps    = 0
 
     for batch in loader:
-        batch = move_batch_to_device(batch, accelerator.device)
+        batch   = move_batch_to_device(batch, accelerator.device)
         outputs = model(
             input_values=batch["input_values"],
             attention_mask=batch["attention_mask"],
-            word_mask=batch["word_mask"],
+            text_input_ids=batch.get("text_input_ids"),
+            text_attention_mask=batch.get("text_attention_mask"),
         )
-        loss, _ = compute_loss(outputs, batch, 1.0, 1.0, 1.0)
-        loss = accelerator.gather(loss.detach()).mean()
-        total_loss += float(loss.cpu())
-        n_steps += 1
+        loss, _ = compute_loss(outputs, batch, w_sent, w_pfeat)
+        total_loss += float(accelerator.gather(loss.detach()).mean().cpu())
+        n_steps    += 1
 
-    return {"val_loss": total_loss / max(1, n_steps)}
+        all_pred.append(outputs["sent_pred"].detach().cpu())
+        all_target.append(batch["sent_targets"].cpu())
+
+    metrics: Dict[str, float] = {"val_loss": total_loss / max(1, n_steps)}
+
+    if all_pred:
+        preds   = torch.cat(all_pred,   dim=0).numpy()  # (N, 5)
+        targets = torch.cat(all_target, dim=0).numpy()  # (N, 5)
+
+        for i, dim in enumerate(SENT_DIMS):
+            p, t = preds[:, i], targets[:, i]
+            metrics[f"mae_{dim}"]  = float(np.mean(np.abs(p - t)))
+            metrics[f"rmse_{dim}"] = float(np.sqrt(np.mean((p - t) ** 2)))
+            if len(p) > 1 and np.std(p) > 1e-6 and np.std(t) > 1e-6:
+                metrics[f"pearson_{dim}"]  = float(pearsonr(p, t)[0])
+                metrics[f"spearman_{dim}"] = float(spearmanr(p, t)[0])
+            else:
+                metrics[f"pearson_{dim}"]  = 0.0
+                metrics[f"spearman_{dim}"] = 0.0
+
+    return metrics
 
 
-# -------------------------
-# Main
-# -------------------------
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", type=str, default="mispeech/speechocean762", help="HF dataset name/path")
-    ap.add_argument("--train_split", type=str, default="train")
-    ap.add_argument("--valid_split", type=str, default="test")
-    ap.add_argument("--model", type=str, default="facebook/hubert-base-ls960")
-
-    ap.add_argument("--out_dir", type=str, default="ckpt_hubert_multitask")
-    ap.add_argument("--epochs", type=int, default=5)
-    ap.add_argument("--batch_size", type=int, default=4)
-    ap.add_argument("--lr", type=float, default=2e-5)
-    ap.add_argument("--wd", type=float, default=0.01)
-    ap.add_argument("--dropout", type=float, default=0.1)
-    ap.add_argument("--freeze_fe", action="store_true")
-
-    ap.add_argument("--max_words", type=int, default=60)
-    ap.add_argument("--num_workers", type=int, default=2)
-    ap.add_argument("--seed", type=int, default=42)
-
-    ap.add_argument("--w_sent", type=float, default=1.0)
-    ap.add_argument("--w_pfeat", type=float, default=0.5)
-    ap.add_argument("--w_words", type=float, default=1.0)
-
-    ap.add_argument("--log_every", type=int, default=50)
+    ap = argparse.ArgumentParser(description="Fine-tune HuBERT on SpeechOcean762")
+    ap.add_argument("--dataset",     type=str,   default="mispeech/speechocean762")
+    ap.add_argument("--train_split", type=str,   default="train")
+    ap.add_argument("--valid_split", type=str,   default="test")
+    ap.add_argument("--model",       type=str,   default="facebook/hubert-base-ls960")
+    ap.add_argument("--out_dir",     type=str,   default="ckpt_hubert_multitask")
+    ap.add_argument("--epochs",      type=int,   default=5)
+    ap.add_argument("--batch_size",  type=int,   default=4)
+    ap.add_argument("--lr",          type=float, default=2e-5)
+    ap.add_argument("--wd",          type=float, default=0.01)
+    ap.add_argument("--dropout",     type=float, default=0.1)
+    ap.add_argument("--freeze_fe",   action="store_true",
+                    help="Freeze HuBERT CNN feature extractor weights")
+    ap.add_argument("--d_model",     type=int,   default=256,
+                    help="Shared projection dimension for audio and text streams")
+    ap.add_argument("--num_heads",   type=int,   default=8,
+                    help="Attention heads in cross-attention and Transformer block")
+    ap.add_argument("--num_audio_transformer_layers", type=int, default=1,
+                    help="Pre-fusion audio self-attention depth (0 = disabled)")
+    ap.add_argument("--num_transformer_layers", type=int, default=2,
+                    help="Number of post-fusion Transformer encoder layers")
+    ap.add_argument("--mlp_hidden_layers",      type=int, default=2,
+                    help="Hidden FC→ReLU→Dropout blocks in the MLP scoring head")
+    ap.add_argument("--num_unfreeze_hubert_layers", type=int, default=12,
+                    help="Unfreeze top-N HuBERT transformer layers (12 = full backbone, 0 = all frozen)")
+    ap.add_argument("--num_workers", type=int,   default=2)
+    ap.add_argument("--seed",        type=int,   default=42)
+    ap.add_argument("--w_sent",      type=float, default=1.0)
+    ap.add_argument("--w_pfeat",     type=float, default=0.0,
+                    help="Weight for auxiliary prosody feature loss (0 = disabled)")
+    ap.add_argument("--warmup_steps", type=int,   default=100,
+                    help="Linear LR warmup steps (0 = disabled)")
+    ap.add_argument("--patience",    type=int,   default=3,
+                    help="Early stopping patience on pearson_total (0 = disabled)")
+    ap.add_argument("--log_every",   type=int,   default=50)
+    ap.add_argument("--text_model", type=str,   default="Qwen/Qwen3-Embedding-0.6B",
+                    help="HuggingFace model for text embedding stream ('' to disable)")
+    ap.add_argument("--no_freeze_text",  action="store_true",
+                    help="Fine-tune the text encoder instead of keeping it frozen")
     args = ap.parse_args()
 
     set_seed(args.seed)
     accelerator = create_accelerator()
 
-    # Load HF dataset
-    ds = load_dataset(args.dataset)
-
-    # Keep raw audio payload (bytes/path), decode in collator.
-    ds = ds.cast_column("audio", Audio(decode=False))
-
+    # ---- Dataset ----
+    ds       = load_dataset(args.dataset)
+    ds       = ds.cast_column("audio", Audio(decode=False))
     train_ds = ds[args.train_split]
-    valid_ds = ds[args.valid_split] if args.valid_split in ds else None
+    valid_ds = ds.get(args.valid_split)
 
-    # Fail fast on schema issues with explicit row references.
-    preflight_n = min(32, len(train_ds))
-    for i in range(preflight_n):
+    for i in range(min(32, len(train_ds))):
         validate_example_schema(train_ds[i], args.train_split, i)
     if valid_ds is not None:
-        preflight_n_val = min(32, len(valid_ds))
-        for i in range(preflight_n_val):
+        for i in range(min(32, len(valid_ds))):
             validate_example_schema(valid_ds[i], args.valid_split, i)
 
-    feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(args.model)
-    collator = Collator(
-        feature_extractor=feature_extractor,
+    # ---- Collators + loaders ----
+    text_tokenizer  = AutoTokenizer.from_pretrained(args.text_model) if args.text_model else None
+    collator_kwargs = dict(
         sample_rate=16000,
-        max_words=args.max_words,
-        split_name=args.train_split,
+        text_tokenizer=text_tokenizer,
     )
-
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        collate_fn=collator,
+        collate_fn=Collator(**collator_kwargs, split_name=args.train_split),
     )
     valid_loader = None
     if valid_ds is not None:
@@ -504,67 +257,131 @@ def main():
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=args.num_workers,
-            collate_fn=Collator(
-                feature_extractor=feature_extractor,
-                sample_rate=16000,
-                max_words=args.max_words,
-                split_name=args.valid_split,
-            ),
+            collate_fn=Collator(**collator_kwargs, split_name=args.valid_split),
         )
 
+    # ---- Model + optimiser ----
     model = HubertMultiTask(
         model_name=args.model,
-        prosody_feat_dim=4,
+        d_model=args.d_model,
+        num_heads=args.num_heads,
+        num_audio_transformer_layers=args.num_audio_transformer_layers,
+        num_transformer_layers=args.num_transformer_layers,
+        mlp_hidden_layers=args.mlp_hidden_layers,
         dropout=args.dropout,
         freeze_fe=args.freeze_fe,
+        num_unfreeze_hubert_layers=args.num_unfreeze_hubert_layers,
+        text_model_name=args.text_model or None,
+        freeze_text_encoder=not args.no_freeze_text,
+        prosody_feat_dim=len(PROSODY_DIMS),
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    scheduler = make_warmup_scheduler(optimizer, args.warmup_steps)
 
     model, optimizer, train_loader, valid_loader = accelerator.prepare(
         model, optimizer, train_loader, valid_loader
     )
 
     os.makedirs(args.out_dir, exist_ok=True)
-    best_val = float("inf")
+    best_pearson_total = -2.0
+    epochs_no_improve  = 0
 
+    # ---- CSV log setup ----
+    _TRAIN_COLS = ["epoch", "step", "phase", "train_loss", "loss_sent", "loss_prosody"]
+    _VAL_COLS   = ["val_loss"] + [
+        f"{metric}_{dim}"
+        for metric in ("mae", "rmse", "pearson", "spearman")
+        for dim in SENT_DIMS
+    ]
+    _CSV_COLS = _TRAIN_COLS + _VAL_COLS
+    csv_path  = os.path.join(args.out_dir, "result.csv")
+
+    csv_file   = open(csv_path, "w", newline="") if accelerator.is_main_process else None
+    csv_writer = csv.DictWriter(csv_file, fieldnames=_CSV_COLS, restval="") if csv_file else None
+    if csv_writer:
+        csv_writer.writeheader()
+
+    # ---- Training loop ----
     for epoch in range(1, args.epochs + 1):
         model.train()
-        running = 0.0
+        running_loss   = 0.0
+        running_steps  = 0
 
         for step, batch in enumerate(train_loader, start=1):
             batch = move_batch_to_device(batch, accelerator.device)
             outputs = model(
                 input_values=batch["input_values"],
                 attention_mask=batch["attention_mask"],
-                word_mask=batch["word_mask"],
+                text_input_ids=batch.get("text_input_ids"),
+                text_attention_mask=batch.get("text_attention_mask"),
             )
-            loss, logs = compute_loss(outputs, batch, args.w_sent, args.w_pfeat, args.w_words)
+            loss, logs = compute_loss(outputs, batch, args.w_sent, args.w_pfeat)
             accelerator.backward(loss)
-
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
-            running += logs["loss_total"]
+            running_loss  += logs["loss_total"]
+            running_steps += 1
             if accelerator.is_main_process and step % args.log_every == 0:
-                print(f"[epoch {epoch} step {step}] train_loss={running / args.log_every:.4f}")
-                running = 0.0
+                avg_loss = running_loss / running_steps
+                extra = ""
+                if args.w_pfeat > 0:
+                    extra += f"  prosody={logs['loss_prosody']:.4f}"
+                print(
+                    f"[epoch {epoch} step {step}] "
+                    f"train_loss={avg_loss:.4f}  "
+                    f"sent={logs['loss_sent']:.4f}"
+                    f"{extra}"
+                )
+                if csv_writer:
+                    csv_writer.writerow({
+                        "epoch":        epoch,
+                        "step":         step,
+                        "phase":        "train",
+                        "train_loss":   f"{avg_loss:.6f}",
+                        "loss_sent":    f"{logs['loss_sent']:.6f}",
+                        "loss_prosody": f"{logs['loss_prosody']:.6f}",
+                    })
+                    csv_file.flush()
+                running_loss  = 0.0
+                running_steps = 0
 
+        # ---- Validation ----
         if valid_loader is not None:
-            metrics = eval_epoch(model, valid_loader, accelerator)
+            metrics = eval_epoch(model, valid_loader, accelerator, args.w_sent, args.w_pfeat)
             if accelerator.is_main_process:
-                print(f"== epoch {epoch} ==")
-                print(metrics)
+                print(f"\n== epoch {epoch} validation ==")
+                for k, v in metrics.items():
+                    print(f"  {k}: {v:.4f}")
 
-                if metrics["val_loss"] < best_val:
-                    best_val = metrics["val_loss"]
-                    unwrapped = accelerator.unwrap_model(model)
-                    torch.save(unwrapped.state_dict(), os.path.join(args.out_dir, "best.pt"))
-                    print(f"Saved best to {os.path.join(args.out_dir, 'best.pt')}")
+                if csv_writer:
+                    row = {"epoch": epoch, "step": "end", "phase": "val"}
+                    row.update({k: f"{v:.6f}" for k, v in metrics.items()})
+                    csv_writer.writerow(row)
+                    csv_file.flush()
+
+                pearson_total = metrics.get("pearson_total", -2.0)
+                if pearson_total > best_pearson_total:
+                    best_pearson_total = pearson_total
+                    epochs_no_improve  = 0
+                    ckpt_path = os.path.join(args.out_dir, "best.pt")
+                    torch.save(accelerator.unwrap_model(model).state_dict(), ckpt_path)
+                    print(f"  -> saved best checkpoint (pearson_total={pearson_total:.4f})")
+                else:
+                    epochs_no_improve += 1
+                    if args.patience > 0 and epochs_no_improve >= args.patience:
+                        print(f"  -> early stopping (no improvement for {args.patience} epochs)")
+                        break
         else:
             if accelerator.is_main_process:
-                unwrapped = accelerator.unwrap_model(model)
-                torch.save(unwrapped.state_dict(), os.path.join(args.out_dir, f"epoch_{epoch}.pt"))
-                print(f"Saved {os.path.join(args.out_dir, f'epoch_{epoch}.pt')}")
+                ckpt_path = os.path.join(args.out_dir, f"epoch_{epoch}.pt")
+                torch.save(accelerator.unwrap_model(model).state_dict(), ckpt_path)
+                print(f"Saved {ckpt_path}")
+
+    if csv_file:
+        csv_file.close()
+
 
 if __name__ == "__main__":
     main()
