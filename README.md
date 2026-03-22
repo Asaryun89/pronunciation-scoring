@@ -38,7 +38,6 @@ Raw audio (any SR)
 | `accuracy` | Phonetic accuracy |
 | `fluency` | Speech fluency and naturalness |
 | `prosodic` | Prosody, rhythm, and stress |
-| `completeness` | Utterance completeness |
 
 ## Results
 
