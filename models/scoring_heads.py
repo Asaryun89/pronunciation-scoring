@@ -3,7 +3,7 @@ Scoring-head building blocks used by HubertMultiTask.
 
 Architecture (matching the diagram):
   CrossAttentionFusion  — Audio Q, Text K/V  (or both ways)
-  MLPScoringHead        — FC → ReLU → Dropout → FC → Sigmoid × num_aspects
+  MLPScoringHead        — (FC → ReLU → Dropout) × hidden_layers → FC → Sigmoid × num_aspects
 """
 
 from typing import Optional
@@ -58,28 +58,34 @@ class CrossAttentionFusion(nn.Module):
 
 class MLPScoringHead(nn.Module):
     """
-    Two-layer MLP scoring head.
+    Deep MLP scoring head with configurable number of hidden layers.
 
     Maps an utterance embedding to per-aspect scores in [0, 1].
 
-    Pipeline: FC(d_model → d_model) → ReLU → Dropout → FC(d_model → num_aspects) → Sigmoid
+    Pipeline: [ FC(d_model→d_model) → ReLU → Dropout ] × hidden_layers
+              → FC(d_model → num_aspects) → Sigmoid
 
     Args
     ----
-    d_model     : input (and hidden) dimension
-    num_aspects : number of output scores (default 5 for SpeechOcean)
-    dropout     : dropout rate between the two FC layers
+    d_model       : input (and hidden) dimension
+    num_aspects   : number of output scores (default 5 for SpeechOcean)
+    hidden_layers : number of hidden FC→ReLU→Dropout blocks (default 1)
+    dropout       : dropout rate inside each hidden block
     """
 
-    def __init__(self, d_model: int, num_aspects: int = 5, dropout: float = 0.1):
+    def __init__(
+        self,
+        d_model:       int   = 256,
+        num_aspects:   int   = 5,
+        hidden_layers: int   = 1,
+        dropout:       float = 0.1,
+    ):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, num_aspects),
-            nn.Sigmoid(),
-        )
+        layers: list = []
+        for _ in range(hidden_layers):
+            layers += [nn.Linear(d_model, d_model), nn.ReLU(), nn.Dropout(dropout)]
+        layers += [nn.Linear(d_model, num_aspects), nn.Sigmoid()]
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """(B, d_model) → (B, num_aspects)  values in [0, 1]"""

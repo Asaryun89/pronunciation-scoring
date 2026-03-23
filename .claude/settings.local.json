@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"d:/pronunciation_scoring/models/models_inspection.ipynb\")",
+      "Bash(python -m py_compile models/hubert_multitask.py models/train.py inference/predictor.py data/collate.py models/scoring_heads.py)",
+      "Bash(sort -t',' -k17 -rn)",
+      "Bash(python -c \":*)",
+      "Bash(.venv/Scripts/python -c \":*)",
+      "WebFetch(domain:aclanthology.org)",
+      "WebFetch(domain:arxiv.org)",
+      "Bash(python -c \"import pdfplumber; print\\(''ok''\\)\")",
+      "Bash(pip install:*)",
+      "Bash(mkdir -p d:/pronunciation_scoring/notebook)",
+      "Bash(mv d:/pronunciation_scoring/run_inference.ipynb d:/pronunciation_scoring/notebook/)",
+      "Bash(mv d:/pronunciation_scoring/stage_output_inspection.ipynb d:/pronunciation_scoring/notebook/)",
+      "Bash(mv d:/pronunciation_scoring/training_analysis.ipynb d:/pronunciation_scoring/notebook/)"
+    ]
+  }
+}

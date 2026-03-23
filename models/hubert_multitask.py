@@ -29,6 +29,9 @@ Architecture (matches the diagram):
   ----
   Mean-pool over time → MLP: FC → ReLU → Dropout → FC → Sigmoid × 5
 
+  Auxiliary
+  ---------
+  Prosody feature head  — FC → ReLU → FC  (training regulariser, w_pfeat weight)
 """
 
 import os
@@ -54,26 +57,34 @@ class HubertMultiTask(nn.Module):
 
     Parameters
     ----------
-    model_name            : HuBERT checkpoint (HuggingFace hub or local)
-    d_model               : common projection dimension shared by both streams
-    num_heads             : attention heads in cross-attention and Transformer
-    num_transformer_layers: depth of the post-fusion Transformer encoder
-    dropout               : dropout rate used throughout
-    freeze_fe             : freeze HuBERT CNN feature extractor
-    text_model_name       : BERT-style model for the text stream ('' / None = disabled)
-    freeze_text_encoder   : keep text encoder weights frozen during training
+    model_name                  : HuBERT checkpoint (HuggingFace hub or local)
+    d_model                     : common projection dimension shared by both streams
+    num_heads                   : attention heads in all attention blocks
+    num_audio_transformer_layers: pre-fusion audio self-attention depth (0 = disabled)
+    num_transformer_layers      : post-fusion Transformer encoder depth
+    mlp_hidden_layers           : hidden FC→ReLU→Dropout blocks in the scoring head
+    dropout                     : dropout rate used throughout
+    freeze_fe                   : freeze HuBERT CNN feature extractor
+    num_unfreeze_hubert_layers  : unfreeze the top-N HuBERT transformer layers (0 = all frozen)
+    text_model_name             : embedding model for the text stream ('' / None = disabled)
+    freeze_text_encoder         : keep text encoder weights frozen during training
+    prosody_feat_dim            : auxiliary prosody output dimension (default 5)
     """
 
     def __init__(
         self,
-        model_name:             str           = "facebook/hubert-base-ls960",
-        d_model:                int           = 256,
-        num_heads:              int           = 8,
-        num_transformer_layers: int           = 2,
-        dropout:                float         = 0.1,
-        freeze_fe:              bool          = True,
-        text_model_name:        Optional[str] = "Qwen/Qwen3-Embedding-0.6B",
-        freeze_text_encoder:    bool          = True,
+        model_name:                   str           = "facebook/hubert-base-ls960",
+        d_model:                      int           = 256,
+        num_heads:                    int           = 8,
+        num_audio_transformer_layers: int           = 1,
+        num_transformer_layers:       int           = 2,
+        mlp_hidden_layers:            int           = 2,
+        dropout:                      float         = 0.1,
+        freeze_fe:                    bool          = False,
+        num_unfreeze_hubert_layers:   int           = 12,
+        text_model_name:              Optional[str] = "Qwen/Qwen3-Embedding-0.6B",
+        freeze_text_encoder:          bool          = True,
+        prosody_feat_dim:             int           = 5,
     ):
         super().__init__()
 
@@ -81,6 +92,17 @@ class HubertMultiTask(nn.Module):
         self.hubert = HubertModel.from_pretrained(model_name)
         if freeze_fe:
             self.hubert.feature_extractor._freeze_parameters()
+
+        # Partial HuBERT unfreezing: top-N transformer encoder layers become trainable.
+        # All other transformer parameters remain frozen (requires_grad stays False from
+        # HuggingFace default — HuBERT is fully trainable by default, so we flip it).
+        if num_unfreeze_hubert_layers < self.hubert.config.num_hidden_layers:
+            for p in self.hubert.encoder.parameters():
+                p.requires_grad = False
+            if num_unfreeze_hubert_layers > 0:
+                for layer in self.hubert.encoder.layers[-num_unfreeze_hubert_layers:]:
+                    for p in layer.parameters():
+                        p.requires_grad = True
 
         H        = self.hubert.config.hidden_size       # 768 for hubert-base
         n_layers = self.hubert.config.num_hidden_layers + 1  # transformer layers + embedding layer
@@ -107,6 +129,22 @@ class HubertMultiTask(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
+        # ── Pre-fusion audio self-attention block ─────────────────────────
+        # Refines audio representations in the d_model space before cross-attention.
+        # Disabled (identity pass-through) when num_audio_transformer_layers == 0.
+        if num_audio_transformer_layers > 0:
+            _audio_enc = nn.TransformerEncoderLayer(
+                d_model=d_model, nhead=num_heads,
+                dim_feedforward=4 * d_model, dropout=dropout,
+                batch_first=True, norm_first=True,
+            )
+            self.audio_transformer: Optional[nn.TransformerEncoder] = nn.TransformerEncoder(
+                _audio_enc, num_layers=num_audio_transformer_layers,
+                enable_nested_tensor=False,
+            )
+        else:
+            self.audio_transformer = None
+
         # ── Cross-attention fusion (Audio Q, Text K/V) ────────────────────
         self.cross_attn_fusion = CrossAttentionFusion(d_model, num_heads, dropout)
 
@@ -124,8 +162,22 @@ class HubertMultiTask(nn.Module):
             enable_nested_tensor=False,   # pre-LN (norm_first=True) disables nested tensors anyway
         )
 
-        # ── MLP scoring head: FC → ReLU → Dropout → FC → Sigmoid × 5 ─────
-        self.scorer = MLPScoringHead(d_model, num_aspects=5, dropout=dropout)
+        # ── MLP scoring head: (FC → ReLU → Dropout) × mlp_hidden_layers → FC → Sigmoid × 5
+        self.scorer = MLPScoringHead(
+            d_model, num_aspects=5, hidden_layers=mlp_hidden_layers, dropout=dropout
+        )
+
+        # ── Auxiliary prosody feature head (training regulariser) ─────────
+        self.prosody_feat_dim  = prosody_feat_dim
+        self.prosody_feat_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, prosody_feat_dim),
+        )
+
+        # Stored for forward_inference
+        self._d_model = d_model
 
     # ------------------------------------------------------------------
     # Internal encoders
@@ -176,6 +228,67 @@ class HubertMultiTask(nn.Module):
             mask   = text_attention_mask.unsqueeze(-1).float()  # (B, L, 1)
             return (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
         return hidden.mean(dim=1)  # (B, text_H)
+
+    # ------------------------------------------------------------------
+    # Training forward
+    # ------------------------------------------------------------------
+
+    def forward(
+        self,
+        input_values:        torch.Tensor,
+        attention_mask:      Optional[torch.Tensor] = None,
+        text_input_ids:      Optional[torch.Tensor] = None,   # (B, L)
+        text_attention_mask: Optional[torch.Tensor] = None,   # (B, L)
+        # Legacy collator keys (word_mask, phone_mask, word_frame_spans, prosody_feats)
+        # are absorbed here so existing train.py call-sites need no changes.
+        **_,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass used during training.
+
+        Returns
+        -------
+        sent_pred    (B, 5)              — utterance scores in [0, 1]
+        prosody_pred (B, prosody_feat_dim) — auxiliary prosody prediction (unbounded)
+        """
+        # ── Audio path ────────────────────────────────────────────────
+        hidden    = self._layer_weighted_encode(input_values, attention_mask)  # (B, T, H)
+        audio_emb = self.audio_proj(hidden)                                    # (B, T, d_model)
+
+        # ── Text path ─────────────────────────────────────────────────
+        # Mean pool → Linear+LN → (B, 1, d_model) used as K/V in cross-attention
+        text_emb_kv = None
+        if self.text_encoder is not None and text_input_ids is not None:
+            text_emb    = self._encode_text(
+                text_input_ids.to(hidden.device),
+                text_attention_mask.to(hidden.device) if text_attention_mask is not None else None,
+            )                                               # (B, text_H)
+            text_emb_kv = self.text_proj(text_emb).unsqueeze(1)  # (B, 1, d_model)
+
+        # ── Pre-fusion audio self-attention ───────────────────────────
+        if self.audio_transformer is not None:
+            audio_emb = self.audio_transformer(audio_emb)
+
+        # ── Cross-attention fusion (Audio Q, Text K/V) ────────────────
+        if text_emb_kv is not None:
+            fused = self.cross_attn_fusion(audio_emb, text_emb_kv)
+        else:
+            fused = audio_emb
+
+        # ── Post-fusion Transformer block ─────────────────────────────
+        refined = self.transformer(fused)         # (B, T, d_model)
+
+        # ── Utterance-level mean pooling ──────────────────────────────
+        utt_emb = refined.mean(dim=1)             # (B, d_model)
+
+        # ── Scoring head ──────────────────────────────────────────────
+        sent_pred    = self.scorer(utt_emb)                       # (B, 5)
+        prosody_pred = self.prosody_feat_head(utt_emb)            # (B, prosody_feat_dim)
+
+        return {
+            "sent_pred":    sent_pred,
+            "prosody_pred": prosody_pred,
+        }
 
     # ------------------------------------------------------------------
     # Inference forward
