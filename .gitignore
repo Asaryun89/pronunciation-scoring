@@ -39,3 +39,6 @@ Thumbs.db
 .vscode/
 .idea/
 .claude/
+
+
+ckpt_hubert_multitask/

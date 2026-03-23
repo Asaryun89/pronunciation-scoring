@@ -1,7 +1,10 @@
 import numpy as np
 import soundfile as sf
 import scipy.signal as sps
-import webrtcvad
+try:
+    import webrtcvad
+except ImportError:  # pragma: no cover - depends on runtime environment
+    webrtcvad = None
 
 def read_wav(path: str):
     audio, sr = sf.read(path)
@@ -33,6 +36,9 @@ def vad_trim(audio: np.ndarray, sr: int = 16000, aggressiveness: int = 2,
     Simple VAD trimming using webrtcvad.
     Keeps speech frames and removes long silences.
     """
+    if webrtcvad is None:
+        return audio
+
     assert sr in (8000, 16000, 32000, 48000), "webrtcvad supports 8/16/32/48k"
     vad = webrtcvad.Vad(aggressiveness)
 

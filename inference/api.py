@@ -11,7 +11,13 @@ app = FastAPI(title="Pronunciation Scoring API (HuBERT + ASR Alignment)")
 # Example: CHECKPOINT_PATH=ckpt_hubert_multitask/best.pt uvicorn inference.api:app ...
 _ckpt = os.environ.get("CHECKPOINT_PATH", None)
 predictor = PronunciationPredictor(
-    PredictorConfig(device="cpu", whisper_device="cpu", checkpoint_path=_ckpt)
+    PredictorConfig(
+        device="cpu",
+        hubert_name=os.environ.get("HUBERT_MODEL_NAME", "facebook/hubert-base-ls960"),
+        whisper_device="cpu",
+        checkpoint_path=_ckpt,
+        text_model_name=os.environ.get("TEXT_MODEL_NAME") or None,
+    )
 )
 
 @app.post("/score")

@@ -4,8 +4,10 @@ torch
 torchaudio
 transformers
 soundfile
-webrtcvad
+webrtcvad-wheels
 faster-whisper
 fastapi
 uvicorn
 pydantic
+python-multipart
+pydub

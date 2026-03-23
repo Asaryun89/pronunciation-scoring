@@ -1,7 +1,18 @@
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 import numpy as np
-from faster_whisper import WhisperModel
+
+
+def _resolve_whisper_model():
+    """
+    Import faster_whisper lazily so notebooks can recover after dependency install
+    without requiring a hard kernel restart.
+    """
+    try:
+        from faster_whisper import WhisperModel as _WhisperModel
+        return _WhisperModel, None
+    except ImportError as e:  # pragma: no cover - depends on runtime environment
+        return None, str(e)
 
 @dataclass
 class ASRConfig:
@@ -16,7 +27,26 @@ class ASRAligner:
     """
     def __init__(self, cfg: ASRConfig):
         self.cfg = cfg
-        self.model = WhisperModel(cfg.model_size, device=cfg.device, compute_type=cfg.compute_type)
+        WhisperModel, import_error = _resolve_whisper_model()
+        if WhisperModel is None:
+            raise ImportError(
+                "Missing dependency 'faster_whisper'. Install project dependencies with "
+                "`pip install -r requirements.txt`. "
+                f"Original import error: {import_error}"
+            )
+        try:
+            self.model = WhisperModel(
+                cfg.model_size,
+                device=cfg.device,
+                compute_type=cfg.compute_type,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to initialize Faster-Whisper model. "
+                "If you are offline, pre-download the Whisper model or pass a local "
+                "model directory path via `model_size`."
+                f" Original error: {e}"
+            ) from e
 
     def transcribe_with_timestamps(
         self,

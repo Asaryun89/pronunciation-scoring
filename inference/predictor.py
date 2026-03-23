@@ -3,11 +3,11 @@ from typing import Dict, Any, Optional, List
 import numpy as np
 import torch
 from transformers import AutoTokenizer
+import importlib
 
 from utils.preprocessing import preprocess_wav
 from utils.prosody import basic_prosody_features, prosody_to_vector
 
-from models.asr_aligner import ASRAligner, ASRConfig
 from models.constants import SENT_DIMS, SENT_SCALE
 from models.hubert_multitask import HubertMultiTask
 
@@ -20,7 +20,7 @@ class PredictorConfig:
     whisper_device:      str            = "cpu"
     whisper_compute_type: str           = "int8"
     checkpoint_path:     Optional[str]  = None
-    text_model_name:     str            = "Qwen/Qwen3-Embedding-0.6B"
+    text_model_name:     Optional[str]  = None
     """
     Path to a trained HubertMultiTask checkpoint (.pt file).
     If None, the model runs with random weights — scores are not meaningful.
@@ -61,16 +61,28 @@ class PronunciationPredictor:
 
         if cfg.checkpoint_path is not None:
             state = torch.load(cfg.checkpoint_path, map_location=self.device, weights_only=True)
-            self.model.load_state_dict(state, strict=False)
-            self._scoring_validity = f"trained:{cfg.checkpoint_path}"
+            model_state = self.model.state_dict()
+            compatible = {
+                k: v for k, v in state.items()
+                if k in model_state and model_state[k].shape == v.shape
+            }
+            self.model.load_state_dict(compatible, strict=False)
+            skipped = len(state) - len(compatible)
+            if skipped > 0:
+                self._scoring_validity = f"trained_partial:{cfg.checkpoint_path} (skipped={skipped})"
+            else:
+                self._scoring_validity = f"trained:{cfg.checkpoint_path}"
         else:
             self._scoring_validity = "untrained_random_init"
 
         self.model.eval()
 
-        # ASR aligner for word timestamps
-        self.aligner = ASRAligner(
-            ASRConfig(
+        # ASR aligner for word timestamps.
+        # Reloading the module here avoids stale class bindings in long-lived notebook kernels.
+        asr_mod = importlib.import_module("models.asr_aligner")
+        asr_mod = importlib.reload(asr_mod)
+        self.aligner = asr_mod.ASRAligner(
+            asr_mod.ASRConfig(
                 model_size=cfg.whisper_size,
                 device=cfg.whisper_device,
                 compute_type=cfg.whisper_compute_type,
