@@ -1,251 +1,118 @@
-# AGENTS.md — Integration Guide for Web Builders
+# AGENTS.md — Reproducibility Guide
 
-This document is for teammates integrating the pronunciation scoring engine into a web product (frontend, backend, or full-stack).
-
----
-
-## What this package does
-
-Given a WAV audio clip, it returns:
-
-- **5 utterance-level scores** (0–10): `accuracy`, `completeness`, `fluency`, `prosodic`, `total`
-- **Transcript** from Whisper ASR
-- **Per-word timestamps** (`start`, `end` in seconds) and ASR confidence (`asr_prob`)
-- **Prosody metadata**: F0 mean/std, speaking rate, energy, pause ratio
-
-Word-level accuracy scores (`words[].accuracy`, `words[].total`) are `null` in the current model — the utterance-level scores are the reliable outputs to display to users.
+This document tells AI agents (and humans) everything needed to understand,
+run, and extend this repository without additional context.
 
 ---
 
-## Option A — Use the FastAPI server (recommended for web)
+## Project Purpose
 
-The fastest integration path. Your frontend or backend calls a single HTTP endpoint.
+Automatic pronunciation scoring using HuBERT.
+Stage 1 fine-tunes HuBERT-Large with CTC on SpeechOcean762 transcripts.
+The resulting encoder is intended for transfer to phoneme/word/utterance scoring heads (Stage 2, not yet implemented).
 
-### Start the server
+---
+
+## Environment
+
+- Python 3.9+
+- CUDA GPU strongly recommended (tested on CUDA 11.8+)
+- Install deps: `pip install transformers datasets jiwer soundfile librosa accelerate`
+
+---
+
+## Repository Layout
+
+| Path | Purpose |
+|---|---|
+| `train_hubert_speechocean.py` | Main entry point; orchestrates all stages |
+| `ctc_training/config.py` | All hyperparameters and path constants |
+| `ctc_training/processor.py` | Text normalisation, vocab file creation, `Wav2Vec2Processor` |
+| `ctc_training/data.py` | Dataset download, train/val split, per-sample preprocessing |
+| `ctc_training/collator.py` | Batching with independent CTC padding for inputs and labels |
+| `ctc_training/metrics.py` | WER metric factory passed to `Trainer` |
+| `ctc_training/model.py` | `HubertForCTC` loader with frozen CNN encoder |
+| `audio/` | Sample audio files for quick inference checks |
+| `ckpt_hubert_multitask/` | Checkpoint directory (not tracked by git) |
+
+---
+
+## How to Reproduce Stage 1 Training
 
 ```bash
-# Install deps once
-pip install -r requirements.txt
+# 1. Create and activate a virtual environment
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
-# Run (set checkpoint path)
-CHECKPOINT_PATH=ckpt_hubert_multitask/best.pt uvicorn inference.api:app --host 0.0.0.0 --port 8000
+# 2. Install dependencies
+pip install transformers datasets jiwer soundfile librosa accelerate
+
+# 3. Run training
+python train_hubert_speechocean.py
 ```
 
-Windows PowerShell:
-```powershell
-$env:CHECKPOINT_PATH="ckpt_hubert_multitask/best.pt"
-uvicorn inference.api:app --host 0.0.0.0 --port 8000
-```
-
-### Call from your web backend
-
-```python
-import httpx
-
-with open("user_recording.wav", "rb") as f:
-    response = httpx.post(
-        "http://localhost:8000/score",
-        files={"file": ("audio.wav", f, "audio/wav")},
-        params={"language": "en"},
-    )
-result = response.json()
-print(result["total"])     # 0–10
-print(result["text"])      # transcript
-```
-
-### Call from JavaScript / fetch
-
-```js
-const formData = new FormData();
-formData.append("file", audioBlob, "audio.wav");
-
-const res = await fetch("http://localhost:8000/score?language=en", {
-  method: "POST",
-  body: formData,
-});
-const result = await res.json();
-console.log(result.total, result.text);
-```
-
-### Interactive API docs
-
-Visit `http://localhost:8000/docs` to test the endpoint in the browser.
+The script will:
+1. Download `mispeech/speechocean762` from HuggingFace Hub (~1 GB).
+2. Build `vocab.json` from training transcripts (skipped if already present).
+3. Preprocess and cache the dataset (multiprocessing, 4 workers).
+4. Fine-tune `facebook/hubert-large-ls960-ft` for 30 epochs.
+5. Save the best checkpoint (by val WER) to `./hubert-large-speechocean-ctc/`.
+6. Write `test_results.json` with the final test-set WER.
 
 ---
 
-## Option B — Import `PronunciationPredictor` directly (Python backend)
+## Module Responsibilities
 
-Use this when your backend is already Python (Django, Flask, FastAPI, etc.) and you want to embed the scorer in-process.
+### `ctc_training/config.py`
+Single source of truth for all constants. Edit here to change model, dataset,
+output directory, or any training hyperparameter.
 
-```python
-from inference.predictor import PronunciationPredictor, PredictorConfig
+### `ctc_training/processor.py`
+- `normalise_text(text)` — lowercase, strip punctuation except apostrophe,
+  collapse whitespace.
+- `build_vocab(dataset, vocab_path)` — iterates training transcripts, builds a
+  character-level `vocab.json` with `|` (word boundary), `[UNK]`, `[PAD]`.
+- `get_processor(vocab_path)` — constructs `Wav2Vec2Processor` from the vocab
+  file. Must be called after `build_vocab`.
 
-# Create once at startup — loading is slow (~10–20 s)
-predictor = PronunciationPredictor(PredictorConfig(
-    checkpoint_path = "ckpt_hubert_multitask/best.pt",
-    device          = "cuda",       # "cpu" if no GPU
-    whisper_size    = "small",      # "tiny" for speed, "medium" for accuracy
-    whisper_device  = "cuda",
-    language        = "en",
-))
+### `ctc_training/data.py`
+- `load_speechocean()` — downloads dataset, resamples audio to 16 kHz,
+  carves 10% validation split from train.
+- `make_preprocess_fn(processor)` — returns a closure that converts a raw
+  sample to `{input_values, attention_mask, labels}`. Samples longer than
+  `MAX_DURATION_SEC` return `None` fields and are later filtered out.
+- `prepare_dataset(dataset, processor)` — applies preprocessing via
+  `dataset.map` and removes too-long rows.
 
-# Call per request — fast (~0.5–2 s on GPU)
-result = predictor.predict("path/to/uploaded.wav", language="en")
-```
+### `ctc_training/collator.py`
+`DataCollatorCTCWithPadding` — pads `input_values` and `labels` separately
+(required by CTC). Label padding uses `-100` so loss ignores pad positions.
 
-**Important:** Instantiate `PronunciationPredictor` once (e.g. at app startup or as a module-level singleton). Each instantiation loads HuBERT and Whisper from disk.
+### `ctc_training/metrics.py`
+`make_compute_metrics(processor)` — returns a function that decodes predicted
+and reference token IDs and computes WER via `jiwer`.
 
----
-
-## Output schema reference
-
-```json
-{
-  "accuracy":     8.2,
-  "completeness": 9.0,
-  "fluency":      7.5,
-  "prosodic":     7.8,
-  "total":        8.1,
-
-  "text": "she sells sea shells",
-
-  "words": [
-    {
-      "text":              "she",
-      "start":             0.12,
-      "end":               0.40,
-      "asr_prob":          0.97,
-      "accuracy":          null,
-      "total":             null,
-      "stress":            null,
-      "phones":            [],
-      "phones-accuracy":   [],
-      "mispronunciations": []
-    }
-  ],
-
-  "audio": {
-    "path": "path/to/audio.wav"
-  },
-
-  "inference_metadata": {
-    "language":    "en",
-    "duration":    2.4,
-    "frame_hz":    50,
-    "prosody_features": {
-      "f0_mean":       180.3,
-      "f0_std":        40.1,
-      "speaking_rate": 4.1,
-      "energy_mean":   0.05,
-      "pause_ratio":   0.12
-    },
-    "scoring_validity": "trained:ckpt_hubert_multitask/best.pt"
-  }
-}
-```
-
-### Score interpretation
-
-| Score        | Meaning                                      |
-|--------------|----------------------------------------------|
-| `total`      | Overall pronunciation quality (0–10)         |
-| `accuracy`   | Phonemic correctness                         |
-| `completeness` | How completely the sentence was said       |
-| `fluency`    | Speaking smoothness and pace                 |
-| `prosodic`   | Pitch, rhythm, stress patterns               |
-
-Scores follow the SpeechOcean762 annotation scale (0–10, higher is better).
+### `ctc_training/model.py`
+`build_model(processor)` — loads `HubertForCTC`, re-initialises the LM head
+to match the vocabulary size, and freezes the CNN feature encoder.
+To enable full fine-tuning, remove `model.freeze_feature_encoder()`.
 
 ---
 
-## Audio requirements
+## Extending to Stage 2 (Scoring Heads)
 
-| Property    | Required value                        |
-|-------------|---------------------------------------|
-| Format      | WAV (PCM), MP3, FLAC — anything soundfile reads |
-| Sample rate | Any — resampled to 16 kHz internally  |
-| Channels    | Mono or stereo — mixed to mono internally |
-| Duration    | 1–30 s recommended                    |
-
-The pipeline applies VAD (Voice Activity Detection) to strip silence automatically.
+1. Load the saved encoder from `OUTPUT_DIR`.
+2. Freeze the encoder weights.
+3. Add regression heads on top for phoneme/word/utterance scores.
+4. Train on SpeechOcean762 score annotations (`phones`, `words`, `utterance` columns).
 
 ---
 
-## Performance notes
+## Common Issues
 
-| Setting                 | Latency (RTX 4050) | Latency (CPU only) |
-|-------------------------|--------------------|--------------------|
-| `whisper_size="tiny"`   | ~0.4 s             | ~2–4 s             |
-| `whisper_size="small"`  | ~0.8 s             | ~4–8 s             |
-| `whisper_size="medium"` | ~1.5 s             | ~10–20 s           |
-
-- First call after startup is slower (model JIT warm-up).
-- For a web API, keep the predictor alive across requests (do not recreate per request).
-
----
-
-## Environment variables (for the FastAPI server)
-
-| Variable          | Default | Description                           |
-|-------------------|---------|---------------------------------------|
-| `CHECKPOINT_PATH` | `None`  | Path to `best.pt` — required for real scores |
-
----
-
-## Key files to know
-
-| File                        | What it does                                          |
-|-----------------------------|-------------------------------------------------------|
-| `inference/api.py`          | FastAPI app — single POST `/score` endpoint           |
-| `inference/predictor.py`    | `PronunciationPredictor` — the core scoring class     |
-| `inference/infer.py`        | CLI entry point                                       |
-| `models/hubert_multitask.py`| Model architecture (HuBERT + scoring heads)           |
-| `notebook_infer/pipeline.py`| `score_file()` / `score_array()` for notebooks/demos |
-
----
-
-## Common integration patterns
-
-### Django / Flask — singleton predictor
-
-```python
-# myapp/scoring.py
-from inference.predictor import PronunciationPredictor, PredictorConfig
-
-_predictor = None
-
-def get_predictor():
-    global _predictor
-    if _predictor is None:
-        _predictor = PronunciationPredictor(PredictorConfig(
-            checkpoint_path="ckpt_hubert_multitask/best.pt",
-            device="cuda",
-        ))
-    return _predictor
-```
-
-```python
-# myapp/views.py
-from .scoring import get_predictor
-
-def score_view(request):
-    audio_file = request.FILES["audio"]
-    # save to temp file, then:
-    result = get_predictor().predict(tmp_path, language="en")
-    return JsonResponse(result)
-```
-
-### Scoring from a bytes buffer (no disk write)
-
-```python
-import numpy as np, soundfile as sf, io
-
-audio_bytes: bytes = ...  # raw wav bytes from upload
-audio, sr = sf.read(io.BytesIO(audio_bytes))
-audio = audio.astype(np.float32)
-if audio.ndim == 2:
-    audio = audio.mean(axis=1)  # stereo → mono
-
-from notebook_infer.pipeline import score_array, ScoreConfig
-result = score_array(audio, sr, predictor, ScoreConfig())
-```
+| Symptom | Fix |
+|---|---|
+| CUDA out of memory | Reduce `per_device_train_batch_size` to 2 or disable `gradient_checkpointing` |
+| `vocab.json` mismatch | Delete `vocab.json` and rerun — it will be rebuilt |
+| Slow preprocessing | Increase `num_proc` in `prepare_dataset` or cache with `dataset.save_to_disk` |
+| WER not improving | Try unfreezing CNN encoder (`remove freeze_feature_encoder()`) or lowering LR |

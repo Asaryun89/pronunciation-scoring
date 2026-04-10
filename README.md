@@ -1,184 +1,92 @@
-# Pronunciation Scoring — Inference Package
+# Pronunciation Scoring Pipeline
 
-An end-to-end pronunciation scoring pipeline built on HuBERT + Faster-Whisper.
-Accepts a WAV file (or raw numpy array) and returns utterance-level and word-level pronunciation scores.
+A two-stage pipeline for automatic pronunciation scoring using HuBERT.
 
----
-
-## Architecture
+## Pipeline Overview
 
 ```
-WAV → Preprocess → HuBERT encoder ─┐
-                                    ├─→ HubertMultiTask → scores (0–10)
-           Whisper ASR ─────────────┘
-           (word timestamps + transcript)
+Stage 1 — CTC Pretext Task
+  HuBERT-Large (LibriSpeech pretrained)
+       ↓  fine-tune with CTC on SpeechOcean762 transcripts
+  hubert-large-speechocean-ctc/
+
+Stage 2 — Transfer to Scoring Heads  (planned)
+  Frozen HuBERT encoder
+       ↓
+  Phoneme-level score head
+  Word-level score head
+  Utterance-level score head
 ```
 
-The model (`HubertMultiTask`) was fine-tuned on SpeechOcean762 and outputs five utterance scores on the 0–10 scale:
-`accuracy`, `completeness`, `fluency`, `prosodic`, `total`.
+## Repository Structure
 
----
+```
+pronunciation-scoring/
+├── train_hubert_speechocean.py   # Entry point — runs Stage 1 training
+├── ctc_training/
+│   ├── __init__.py
+│   ├── config.py      # Model name, dataset, paths, training hyperparameters
+│   ├── processor.py   # Text normalisation, vocab building, Wav2Vec2Processor
+│   ├── data.py        # Dataset loading (SpeechOcean762) and preprocessing
+│   ├── collator.py    # DataCollatorCTCWithPadding
+│   ├── metrics.py     # WER metric factory for HuggingFace Trainer
+│   └── model.py       # HuBERT-CTC model builder (frozen CNN encoder)
+├── requirements.txt
+└── audio/             # Sample audio files for inference / testing
+```
 
-## Setup
+## Stage 1 — HuBERT CTC Fine-tuning
 
-### 1. Clone and create environment
+**Goal:** Fine-tune HuBERT-Large on SpeechOcean762 transcripts using CTC loss.
+The learned representations are then transferred to pronunciation scoring heads.
+
+**Dataset:** [mispeech/speechocean762](https://huggingface.co/datasets/mispeech/speechocean762)
+— 5,000 English utterances with human pronunciation scores at phoneme, word, and utterance level.
+
+**Base model:** `facebook/hubert-large-ls960-ft` (HuBERT-Large, LibriSpeech 960h)
+
+**Key design choices:**
+- CNN feature encoder is frozen; only transformer layers are fine-tuned.
+- Effective batch size 16 via gradient accumulation (4 × 4).
+- Gradient checkpointing enabled to reduce VRAM usage (~20% speed cost).
+- Best checkpoint selected by lowest validation WER.
+
+### Setup
 
 ```bash
-git clone <repo-url>
-cd pronunciation-scoring
-python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# Linux / macOS:
-source .venv/bin/activate
-```
-
-### 2. Install dependencies
-
-```bash
+pip install transformers datasets jiwer soundfile librosa accelerate
+# or
 pip install -r requirements.txt
 ```
 
-> **GPU (recommended):** Replace the CPU torch wheel with a CUDA-enabled one:
-> ```bash
-> pip install torch --index-url https://download.pytorch.org/whl/cu128
-> ```
-
-### 3. Download the checkpoint
-
-Place the trained model weights at:
-```
-ckpt_hubert_multitask/best.pt
-```
-
-The checkpoint is not distributed in this repo (binary too large). Obtain it from the team's shared storage or contact the maintainer.
-
----
-
-## Quick start
-
-### CLI
+### Run training
 
 ```bash
-python -m inference.infer --wav path/to/audio.wav --lang en
+python train_hubert_speechocean.py
 ```
 
-With an explicit checkpoint path:
+Outputs are saved to `./hubert-large-speechocean-ctc/`:
+- model weights and processor
+- `test_results.json` with final WER on the held-out test set
 
-```bash
-python -m inference.infer --wav path/to/audio.wav --lang en \
-    --checkpoint ckpt_hubert_multitask/best.pt
-```
+### Key hyperparameters (`ctc_training/config.py`)
 
-### Python API
-
-```python
-from inference.predictor import PronunciationPredictor, PredictorConfig
-
-predictor = PronunciationPredictor(PredictorConfig(
-    checkpoint_path = "ckpt_hubert_multitask/best.pt",
-    device          = "cuda",   # or "cpu"
-    whisper_size    = "small",
-    language        = "en",
-))
-
-result = predictor.predict("path/to/audio.wav", language="en")
-print(result["total"])       # overall score 0–10
-print(result["accuracy"])    # accuracy sub-score 0–10
-```
-
-### Notebook
-
-Open [run_inference.ipynb](run_inference.ipynb) for an interactive demo with waveform visualization and a word-by-word score table.
+| Parameter | Value | Notes |
+|---|---|---|
+| `num_train_epochs` | 30 | |
+| `learning_rate` | 1e-4 | linear schedule with 10% warmup |
+| `per_device_train_batch_size` | 4 | × 4 gradient accumulation = 16 effective |
+| `fp16` | auto | enabled when CUDA is available |
+| `MAX_DURATION_SEC` | 20 s | utterances longer than this are dropped |
 
 ---
 
-## FastAPI server
+## TODO / Planned Work
 
-```bash
-CHECKPOINT_PATH=ckpt_hubert_multitask/best.pt uvicorn inference.api:app --host 0.0.0.0 --port 8000
-```
-
-Interactive docs: `http://localhost:8000/docs`
-
-**POST `/score`**
-
-| Field      | Type   | Description                     |
-|------------|--------|---------------------------------|
-| `file`     | file   | WAV audio file (multipart form) |
-| `language` | string | ISO-639-1 code, default `"en"`  |
-
----
-
-## Output schema
-
-```json
-{
-  "accuracy":     8.2,
-  "completeness": 9.0,
-  "fluency":      7.5,
-  "prosodic":     7.8,
-  "total":        8.1,
-  "text":         "she sells sea shells",
-  "words": [
-    {
-      "text":    "she",
-      "start":   0.12,
-      "end":     0.40,
-      "asr_prob": 0.97,
-      "accuracy": null,
-      "total":    null
-    }
-  ],
-  "audio": { "path": "path/to/audio.wav" },
-  "inference_metadata": {
-    "language":         "en",
-    "duration":         2.4,
-    "frame_hz":         50,
-    "prosody_features": { "f0_mean": 180.3, "speaking_rate": 4.1, "...": "..." },
-    "scoring_validity": "trained:ckpt_hubert_multitask/best.pt"
-  }
-}
-```
-
-> **Note:** `words[].accuracy` and `words[].total` are `null` — word-level scoring requires a separate word-level model head not yet trained. Word entries carry timestamps (`start`, `end`) and ASR confidence (`asr_prob`) only.
-
----
-
-## Repository layout
-
-```
-inference/
-  api.py          — FastAPI app (POST /score)
-  predictor.py    — PronunciationPredictor class (main entry point)
-  infer.py        — CLI wrapper
-
-models/
-  hubert_multitask.py  — HubertMultiTask model definition
-  asr_aligner.py       — Faster-Whisper wrapper
-  scoring_heads.py     — utterance scoring MLP heads
-  constants.py         — shared dimension/scale constants
-  ctc_aligner.py       — CTC forced aligner (optional, not used by default)
-
-utils/
-  preprocessing.py — resample, VAD, normalize
-  prosody.py       — F0 / energy / rate feature extraction
-  alignment.py     — frame-to-word span mapping
-
-notebook_infer/
-  pipeline.py      — score_file() / score_array() helpers for notebooks
-  display.py       — rich display utilities (waveform plot, score table)
-
-run_inference.ipynb  — interactive demo notebook
-```
-
----
-
-## Requirements
-
-- Python 3.10+
-- PyTorch 2.x (CPU or CUDA)
-- faster-whisper, transformers, soundfile, webrtcvad
-- fastapi + uvicorn (for the API server)
-
-See [requirements.txt](requirements.txt) for the full pinned list.
+- SSL masking strategies for phoneme prediction:
+  - Replace phonemes with a mask token
+  - Zero 1-dimensional features
+  - Zero multi-dimensional prosodic features
+- Transfer learning heads for phoneme, word, and utterance-level scores
+- Vowel/consonant classification auxiliary task
+- Articulation trait prediction
