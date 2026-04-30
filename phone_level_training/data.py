@@ -1,6 +1,6 @@
 import torch
 from alignment import align
-from features import extract_ssl_and_logprob, aggregate_to_phone, compute_gop, compute_duration
+from features import extract_ssl_and_logprob, aggregate_ssl, compute_gop, compute_duration
 
 class PhoneDataset(torch.utils.data.Dataset):
     def __init__(self, dataset, model, processor, phone2id):
@@ -35,14 +35,19 @@ class PhoneDataset(torch.utils.data.Dataset):
         ssl, log_probs = extract_ssl_and_logprob(self.model, input_values)
 
         frame2phone = align(log_probs, phone_ids)
+        num_phones = len(phone_ids)
 
-        phone_ssl = aggregate_to_phone(ssl, frame2phone, len(phone_ids))
-        gop = compute_gop(log_probs, phone_ids, frame2phone)
-        dur = compute_duration(frame2phone, len(phone_ids))
+        phone_ssl = aggregate_ssl(ssl, frame2phone, num_phones)   # (T, 1024)
+        gop = compute_gop(log_probs, phone_ids, frame2phone)      # (T, 1)
+        dur = compute_duration(frame2phone, num_phones)           # (T, 1)
 
-        phone_ids_tensor = torch.tensor(phone_ids)
-        phone_embed = self.embedding(phone_ids_tensor)
+        phone_ids_tensor = torch.tensor(phone_ids, dtype=torch.long)
+        scores_tensor = torch.tensor(scores, dtype=torch.float)
 
-        feat = torch.cat([phone_ssl, gop, dur, phone_embed], dim=-1)
-
-        return feat, torch.tensor(scores, dtype=torch.float)
+        return {
+            "ssl": phone_ssl,
+            "gop": gop,
+            "dur": dur,
+            "phone_ids": phone_ids_tensor,
+            "scores": scores_tensor
+        }

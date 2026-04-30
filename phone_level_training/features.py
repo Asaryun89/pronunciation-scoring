@@ -21,7 +21,7 @@ def extract_ssl_and_logprob(model, input_values):
 
     return ssl, log_probs
 
-def aggregate_to_phone(ssl, frame2phone, num_phones):
+def aggregate_ssl(ssl, frame2phone, num_phones):
     out = []
     for i in range(num_phones):
         idx = (frame2phone == i).nonzero().squeeze(-1)
