@@ -3,6 +3,8 @@ scipy
 torch
 torchaudio
 transformers
+datasets
+librosa
 soundfile
 webrtcvad
 faster-whisper
