@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-HubertScoringModel: end-to-end pronunciation scoring via HuBERT + cross-attention.
+HubertScoringModel: end-to-end pronunciation scoring via HuBERT + BGE cross-attention.
 
 Architecture::
 
@@ -9,33 +9,38 @@ Architecture::
         → HuBERT encoder (layer-weighted hidden state sum)
         → Linear projection → d_model
         → Optional audio Transformer (num_audio_transformer_layers layers)
-        → CrossAttentionFusion (Q=audio, K/V=phoneme embeddings)
+        → CrossAttentionFusion (Q=audio, K/V=text sentence embedding)
         → Transformer encoder (num_fusion_transformer_layers layers)
         → mean pool over time
         → MLPScoringHead → 5 utterance scores in [0, 1]
         └→ Prosody auxiliary head → 5 prosodic features
+
+# TODO(phase2): Swap HuBERT backbone to HuBERT-CTC from Linh's checkpoint
+# See: branch linh/hubert_only, model: hubert-large-speechocean-ctc
+# Requires: update audio_proj dim 768 → 1024, layer_weights size 13 → 25
+
 """
 
 from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
-from transformers import HubertModel
+from transformers import AutoModel
 
-from models.phoneme_embedder import PhonemeEmbedder
-from models.phoneme_vocab import VOCAB_SIZE
 from models.scoring_heads import CrossAttentionFusion, MLPScoringHead
+from models.text_embedder import BGETextEmbedder
 
 
 class HubertScoringModel(nn.Module):
-    """Multi-task pronunciation scoring model.
+    """Multi-task pronunciation scoring model with BGE text branch.
 
-    Encodes audio with a layer-weighted HuBERT backbone, attends over
-    reference phoneme embeddings via cross-attention, and predicts five
+    Encodes audio with a layer-weighted HuBERT backbone, conditions on a
+    BGE sentence embedding via cross-attention, and predicts five
     sentence-level pronunciation scores plus five prosodic features.
 
     Args:
-        model_name: HuggingFace model ID for HuBERT.
+        hubert_model_name: HuggingFace model ID for HuBERT.
+        bge_model_name: HuggingFace model ID for BGE text encoder.
         d_model: Internal embedding dimension used throughout the model.
         num_heads: Number of attention heads in all Transformer components.
         num_audio_transformer_layers: Layers of audio-only Transformer encoder
@@ -48,13 +53,15 @@ class HubertScoringModel(nn.Module):
             extractor weights.
         num_unfreeze_hubert_layers: Number of trailing HuBERT Transformer
             encoder layers to keep trainable; all others are frozen.
+        freeze_bge: Whether to freeze all BGE encoder parameters.
         num_aspects: Number of sentence-level pronunciation score aspects.
         prosody_feat_dim: Dimensionality of the prosody auxiliary target.
     """
 
     def __init__(
         self,
-        model_name: str = "facebook/hubert-base-ls960",
+        hubert_model_name: str = "facebook/hubert-base-ls960",
+        bge_model_name: str = "BAAI/bge-small-en-v1.5",
         d_model: int = 256,
         num_heads: int = 8,
         num_audio_transformer_layers: int = 1,
@@ -63,13 +70,14 @@ class HubertScoringModel(nn.Module):
         dropout: float = 0.1,
         freeze_feature_extractor: bool = True,
         num_unfreeze_hubert_layers: int = 12,
+        freeze_bge: bool = True,
         num_aspects: int = 5,
         prosody_feat_dim: int = 5,
     ) -> None:
         super().__init__()
 
         # ── HuBERT backbone ──────────────────────────────────────────────────
-        self.hubert: HubertModel = HubertModel.from_pretrained(model_name)
+        self.hubert = AutoModel.from_pretrained(hubert_model_name)
 
         if freeze_feature_extractor:
             self.hubert.feature_extractor._freeze_parameters()
@@ -91,8 +99,8 @@ class HubertScoringModel(nn.Module):
         hubert_hidden_size: int = self.hubert.config.hidden_size
         self.audio_proj = nn.Linear(hubert_hidden_size, d_model)
 
-        # ── Phoneme embedder ─────────────────────────────────────────────────
-        self.phoneme_embedder = PhonemeEmbedder(d_model, VOCAB_SIZE, dropout=dropout)
+        # ── BGE text embedder ────────────────────────────────────────────────
+        self.text_embedder = BGETextEmbedder(d_model, bge_model_name, freeze_encoder=freeze_bge, dropout=dropout)
 
         # ── Optional audio Transformer ───────────────────────────────────────
         if num_audio_transformer_layers > 0:
@@ -103,11 +111,11 @@ class HubertScoringModel(nn.Module):
                 dropout=dropout,
                 batch_first=True,
                 norm_first=True,
+                enable_nested_tensor=False,
             )
             self.audio_transformer: Optional[nn.TransformerEncoder] = nn.TransformerEncoder(
                 audio_layer,
                 num_layers=num_audio_transformer_layers,
-                enable_nested_tensor=False,
             )
         else:
             self.audio_transformer = None
@@ -123,11 +131,11 @@ class HubertScoringModel(nn.Module):
             dropout=dropout,
             batch_first=True,
             norm_first=True,
+            enable_nested_tensor=False,
         )
         self.fusion_transformer = nn.TransformerEncoder(
             fusion_layer,
             num_layers=num_fusion_transformer_layers,
-            enable_nested_tensor=False,
         )
 
         # ── Output heads ─────────────────────────────────────────────────────
@@ -139,8 +147,6 @@ class HubertScoringModel(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(d_model, prosody_feat_dim),
         )
-
-    # ── Internal helpers ─────────────────────────────────────────────────────
 
     def _encode_audio(
         self,
@@ -161,51 +167,43 @@ class HubertScoringModel(nn.Module):
             attention_mask=attention_mask,
             output_hidden_states=True,
         )
-        # hidden_states: tuple of (num_hidden_layers+1) tensors each (B, T, H)
-        stacked = torch.stack(out.hidden_states, dim=0)           # (n+1, B, T, H)
-        weights = torch.softmax(self.layer_weights, dim=0)         # (n+1,)
+        stacked = torch.stack(out.hidden_states, dim=0)            # (n+1, B, T, H)
+        weights = torch.softmax(self.layer_weights, dim=0)          # (n+1,)
         return (weights[:, None, None, None] * stacked).sum(dim=0)  # (B, T, H)
-
-    # ── Forward ──────────────────────────────────────────────────────────────
 
     def forward(
         self,
         input_values: torch.Tensor,
-        phoneme_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        phoneme_mask: Optional[torch.Tensor] = None,
+        text_input_ids: torch.Tensor,
+        text_attention_mask: torch.Tensor,
+        audio_attention_mask: Optional[torch.Tensor] = None,
+        **_,
     ) -> Dict[str, torch.Tensor]:
         """Run the full pronunciation scoring pipeline.
 
         Args:
             input_values: ``(B, num_samples)`` raw 16 kHz waveform tensor.
-            phoneme_ids: ``(B, P)`` phoneme vocabulary ID tensor.
-            attention_mask: ``(B, num_samples)`` mask where 1 = valid, 0 = pad.
-            phoneme_mask: ``(B, P)`` bool mask where ``True`` = valid token.
-                Inverted before passing to cross-attention (``True`` = ignore
-                in :class:`~torch.nn.MultiheadAttention`).
+            text_input_ids: ``(B, L)`` tokenised script.
+            text_attention_mask: ``(B, L)`` 1=valid, 0=pad.
+            audio_attention_mask: ``(B, num_samples)`` optional audio padding mask.
 
         Returns:
             Dict containing:
 
-            - ``"sent_pred"``: ``(B, num_aspects)`` scores in ``[0, 1]``.
-            - ``"prosody_pred"``: ``(B, prosody_feat_dim)`` raw prosody outputs.
+            - ``"sent_pred"``: ``(B, 5)`` scores in ``[0, 1]``.
+            - ``"prosody_pred"``: ``(B, 5)`` raw prosody outputs.
         """
-        audio = self._encode_audio(input_values, attention_mask)  # (B, T, H)
-        audio = self.audio_proj(audio)                             # (B, T, d_model)
+        audio = self._encode_audio(input_values, audio_attention_mask)  # (B, T, H)
+        audio = self.audio_proj(audio)                                   # (B, T, d_model)
 
         if self.audio_transformer is not None:
             audio = self.audio_transformer(audio)
 
-        phoneme_emb = self.phoneme_embedder(phoneme_ids)  # (B, P, d_model)
+        # text_emb: (B, 1, d_model) — L=1, no padding mask needed
+        text_emb = self.text_embedder(text_input_ids, text_attention_mask)
 
-        # MultiheadAttention treats True as "ignore" — invert valid→ignore mask
-        key_padding_mask: Optional[torch.Tensor] = None
-        if phoneme_mask is not None:
-            key_padding_mask = ~phoneme_mask.bool()
-
-        fused = self.cross_attn(audio, phoneme_emb, key_padding_mask)  # (B, T, d_model)
-        fused = self.fusion_transformer(fused)                          # (B, T, d_model)
+        fused = self.cross_attn(audio, text_emb)          # (B, T, d_model)
+        fused = self.fusion_transformer(fused)             # (B, T, d_model)
 
         pooled = fused.mean(dim=1)  # (B, d_model)
 

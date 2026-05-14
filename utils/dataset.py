@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 """
-SpeechOcean762 dataset wrapper for pronunciation scoring.
+SpeechOcean762 dataset wrapper for pronunciation scoring with BGE text embeddings.
 
-Loads the ``mispeech/speechocean762`` dataset from HuggingFace, converts raw
-audio and phoneme annotations into model-ready tensors, and provides a
+Loads the ``mispeech/speechocean762`` dataset from HuggingFace, tokenises the
+script text for BGE, extracts prosody features from audio, and provides a
 ``collate_fn`` for batched DataLoaders.
 
 ``librosa`` is imported lazily inside :func:`extract_prosody_features` so this
@@ -16,13 +16,15 @@ from typing import Any, Dict, List
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-
-from models.phoneme_vocab import PAD_ID, SIL_ID, phonemes_to_ids
+from transformers import AutoTokenizer
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 SCORE_KEYS: List[str] = ["accuracy", "completeness", "fluency", "prosody", "total"]
 SCORE_MAX: float = 10.0
+BGE_MODEL_NAME: str = "BAAI/bge-small-en-v1.5"
+BGE_MAX_LENGTH: int = 128  # scripts are short
+
 
 # ─── Score helpers ────────────────────────────────────────────────────────────
 
@@ -38,32 +40,6 @@ def normalize_scores(sample: dict) -> torch.Tensor:
     """
     scores = [float(sample[k]) for k in SCORE_KEYS]
     return torch.tensor(scores, dtype=torch.float32) / SCORE_MAX
-
-
-# ─── Phoneme sequence builder ─────────────────────────────────────────────────
-
-
-def build_phoneme_sequence(words: List[Any], insert_silence: bool = True) -> List[int]:
-    """Convert a list of word annotation dicts into a flat phoneme ID list.
-
-    Args:
-        words: List of word dicts, each containing a ``"phones"`` key with a
-            list of raw phoneme token strings.
-        insert_silence: When ``True``, inserts :data:`~models.phoneme_vocab.SIL_ID`
-            between consecutive words (not before the first word).
-
-    Returns:
-        Flat list of integer phoneme IDs.
-    """
-    ids: List[int] = []
-    for i, word in enumerate(words):
-        phones: List[Any] = word.get("phones", []) or []
-        if not phones:
-            continue
-        if insert_silence and i > 0:
-            ids.append(SIL_ID)
-        ids.extend(phonemes_to_ids(phones))
-    return ids
 
 
 # ─── Prosody feature extraction ───────────────────────────────────────────────
@@ -122,20 +98,23 @@ class SpeechOcean762Dataset(Dataset):
     Args:
         split: Dataset split — typically ``"train"`` or ``"test"``.
         max_audio_seconds: Truncate audio exceeding this duration (seconds).
-        insert_silence: Insert silence tokens between words in phoneme sequences.
+        bge_model_name: HuggingFace model ID for the BGE tokenizer.
+        max_text_length: Maximum token length for script tokenisation.
     """
 
     def __init__(
         self,
         split: str = "train",
         max_audio_seconds: float = 20.0,
-        insert_silence: bool = True,
+        bge_model_name: str = BGE_MODEL_NAME,
+        max_text_length: int = BGE_MAX_LENGTH,
     ) -> None:
         from datasets import load_dataset  # lazy import
 
         self.data = load_dataset("mispeech/speechocean762", split=split)
         self.max_audio_seconds = max_audio_seconds
-        self.insert_silence = insert_silence
+        self.max_text_length = max_text_length
+        self.tokenizer = AutoTokenizer.from_pretrained(bge_model_name)
 
     def __len__(self) -> int:
         """Return the number of utterances in the split."""
@@ -148,7 +127,8 @@ class SpeechOcean762Dataset(Dataset):
             Dict with keys:
 
             - ``"input_values"``: ``(T,)`` float32 audio waveform.
-            - ``"phoneme_ids"``: ``(P,)`` long phoneme ID sequence.
+            - ``"text_input_ids"``: ``(L,)`` long tokenised script.
+            - ``"text_attention_mask"``: ``(L,)`` long 1=valid, 0=pad.
             - ``"prosody_feats"``: ``(5,)`` float32 prosodic features.
             - ``"sent_scores"``: ``(5,)`` float32 normalised scores in ``[0, 1]``.
         """
@@ -160,15 +140,26 @@ class SpeechOcean762Dataset(Dataset):
         max_samples = int(self.max_audio_seconds * sr)
         audio = audio[:max_samples]
 
-        words = sample.get("words", []) or []
-        phoneme_ids = build_phoneme_sequence(words, self.insert_silence)
-        if not phoneme_ids:
-            phoneme_ids = [SIL_ID]
+        encoded = self.tokenizer(
+            sample["text"],
+            max_length=self.max_text_length,
+            padding=False,
+            truncation=True,
+            return_tensors="pt",
+        )
+        text_input_ids = encoded["input_ids"].squeeze(0)         # (L,)
+        text_attention_mask = encoded["attention_mask"].squeeze(0)  # (L,)
+
+        try:
+            prosody_feats = extract_prosody_features(audio, sr)
+        except Exception:
+            prosody_feats = torch.zeros(5, dtype=torch.float32)
 
         return {
             "input_values": torch.tensor(audio, dtype=torch.float32),
-            "phoneme_ids": torch.tensor(phoneme_ids, dtype=torch.long),
-            "prosody_feats": extract_prosody_features(audio, sr),
+            "text_input_ids": text_input_ids,
+            "text_attention_mask": text_attention_mask,
+            "prosody_feats": prosody_feats,
             "sent_scores": normalize_scores(sample),
         }
 
@@ -186,34 +177,41 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
         Dict with padded batch tensors:
 
         - ``"input_values"``: ``(B, T_max)`` float32, zero-padded.
-        - ``"attention_mask"``: ``(B, T_max)`` long, 1 = valid, 0 = pad.
-        - ``"phoneme_ids"``: ``(B, P_max)`` long, padded with :data:`~models.phoneme_vocab.PAD_ID`.
-        - ``"phoneme_mask"``: ``(B, P_max)`` bool, ``True`` = valid token.
+        - ``"audio_attention_mask"``: ``(B, T_max)`` long, 1=valid, 0=pad.
+        - ``"text_input_ids"``: ``(B, L_max)`` long, padded with tokenizer pad_token_id.
+        - ``"text_attention_mask"``: ``(B, L_max)`` long, 1=valid, 0=pad.
         - ``"prosody_feats"``: ``(B, 5)`` float32 stacked prosody features.
         - ``"sent_scores"``: ``(B, 5)`` float32 stacked normalised scores.
     """
+    # Infer pad_token_id from the first item's attention mask length — stored on dataset
+    # We use 0 as a safe default; the tokenizer's pad_token_id is passed via closure
+    # below via _get_pad_token_id. Instead we derive it from the batch structure.
+    # BGE tokenizer pad_token_id is 0 ([PAD] token), but we rely on what's stored.
+    # Since collate_fn doesn't have dataset reference, we use a module-level default.
+    _pad_token_id = 0  # BGE/BERT-style tokenizers use 0 for [PAD]
+
     max_audio = max(s["input_values"].size(0) for s in batch)
-    max_phone = max(s["phoneme_ids"].size(0) for s in batch)
+    max_text = max(s["text_input_ids"].size(0) for s in batch)
     B = len(batch)
 
     input_values = torch.zeros(B, max_audio, dtype=torch.float32)
-    attention_mask = torch.zeros(B, max_audio, dtype=torch.long)
-    phoneme_ids = torch.full((B, max_phone), PAD_ID, dtype=torch.long)
-    phoneme_mask = torch.zeros(B, max_phone, dtype=torch.bool)
+    audio_attention_mask = torch.zeros(B, max_audio, dtype=torch.long)
+    text_input_ids = torch.full((B, max_text), _pad_token_id, dtype=torch.long)
+    text_attention_mask = torch.zeros(B, max_text, dtype=torch.long)
 
     for i, sample in enumerate(batch):
         T = sample["input_values"].size(0)
-        P = sample["phoneme_ids"].size(0)
+        L = sample["text_input_ids"].size(0)
         input_values[i, :T] = sample["input_values"]
-        attention_mask[i, :T] = 1
-        phoneme_ids[i, :P] = sample["phoneme_ids"]
-        phoneme_mask[i, :P] = True
+        audio_attention_mask[i, :T] = 1
+        text_input_ids[i, :L] = sample["text_input_ids"]
+        text_attention_mask[i, :L] = sample["text_attention_mask"]
 
     return {
         "input_values": input_values,
-        "attention_mask": attention_mask,
-        "phoneme_ids": phoneme_ids,
-        "phoneme_mask": phoneme_mask,
+        "audio_attention_mask": audio_attention_mask,
+        "text_input_ids": text_input_ids,
+        "text_attention_mask": text_attention_mask,
         "prosody_feats": torch.stack([s["prosody_feats"] for s in batch]),
         "sent_scores": torch.stack([s["sent_scores"] for s in batch]),
     }

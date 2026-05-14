@@ -11,13 +11,13 @@ import torch.nn as nn
 
 
 class CrossAttentionFusion(nn.Module):
-    """Fuse audio embeddings with phoneme embeddings via multi-head cross-attention.
+    """Fuse audio embeddings with context embeddings via multi-head cross-attention.
 
-    Query = audio frames, Key/Value = phoneme embeddings.  The fused output is
+    Query = audio frames, Key/Value = context embeddings.  The fused output is
     formed via residual connection and LayerNorm.
 
     Args:
-        d_model: Embedding dimension shared by audio and phoneme branches.
+        d_model: Embedding dimension shared by audio and context branches.
         num_heads: Number of attention heads.
         dropout: Dropout applied to the attention output before the residual add.
     """
@@ -36,24 +36,24 @@ class CrossAttentionFusion(nn.Module):
     def forward(
         self,
         audio_emb: torch.Tensor,
-        phoneme_emb: torch.Tensor,
+        context_emb: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Apply cross-attention fusion.
 
         Args:
             audio_emb: ``(B, T, D)`` audio frame embeddings used as queries.
-            phoneme_emb: ``(B, L, D)`` phoneme embeddings used as keys and values.
+            context_emb: ``(B, L, D)`` context embeddings used as keys and values.
             key_padding_mask: ``(B, L)`` bool mask; ``True`` = ignore that key
                 position (passed directly to :class:`~torch.nn.MultiheadAttention`).
 
         Returns:
-            ``(B, T, D)`` audio embeddings enriched with phoneme context.
+            ``(B, T, D)`` audio embeddings enriched with context.
         """
         attn_out, _ = self.attn(
             query=audio_emb,
-            key=phoneme_emb,
-            value=phoneme_emb,
+            key=context_emb,
+            value=context_emb,
             key_padding_mask=key_padding_mask,
         )
         return self.norm(audio_emb + self.dropout(attn_out))

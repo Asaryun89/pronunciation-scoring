@@ -1,7 +1,7 @@
 # Pronunciation Scoring
 
 Automatic pronunciation scoring for L2 English learners.
-The system uses a HuBERT encoder fused with reference phoneme embeddings via
+The system uses a HuBERT encoder fused with a BGE sentence embedding via
 cross-attention to predict five sentence-level scores and auxiliary prosodic features.
 
 ---
@@ -13,14 +13,15 @@ Audio waveform (16 kHz)
     → HuBERT encoder  (layer-weighted sum of all hidden states)
     → Linear projection  →  d_model = 256
     → Audio Transformer  (1 layer, pre-LN)
-    → CrossAttentionFusion  (Q = audio frames, K/V = phoneme embeddings)  ←── Reference phonemes
-    → Fusion Transformer  (2 layers, pre-LN)                                   from words[*]["phones"]
+    → CrossAttentionFusion  (Q = audio frames, K/V = text embedding)  ←── Reference script
+    → Fusion Transformer  (2 layers, pre-LN)                               BGE mean-pool vector
     → mean-pool over time
     → MLPScoringHead  →  5 scores  [0, 1]   (accuracy, completeness, fluency, prosody, total)
     → Prosody aux head  →  5 prosodic features
 ```
 
-Phoneme source: **SpeechOcean762** `words[*]["phones"]` field — no G2P, no ASR alignment.
+Text branch: **BAAI/bge-small-en-v1.5** — script tokenised and mean-pooled to a single
+`(B, 1, 256)` sentence vector. BGE encoder frozen by default.
 
 ---
 
@@ -29,8 +30,7 @@ Phoneme source: **SpeechOcean762** `words[*]["phones"]` field — no G2P, no ASR
 ```
 pronunciation-scoring/
 ├── models/
-│   ├── phoneme_vocab.py      # ARPABET vocabulary (72 tokens), normalization helpers
-│   ├── phoneme_embedder.py   # PhonemeEmbedder — token + positional embeddings
+│   ├── text_embedder.py      # BGETextEmbedder — wraps BGE, projects 384 → d_model
 │   ├── scoring_heads.py      # CrossAttentionFusion, MLPScoringHead
 │   ├── scoring_model.py      # HubertScoringModel — full end-to-end model
 │   └── train.py              # Training entry point (TrainConfig, training loop, CLI)
@@ -71,33 +71,36 @@ pip install -r requirements.txt
 python -m models.train
 ```
 
-This downloads `facebook/hubert-base-ls960` and the SpeechOcean762 dataset on
-first run, then trains for 10 epochs saving to `runs/exp1/`.
+Downloads `facebook/hubert-base-ls960`, `BAAI/bge-small-en-v1.5`, and the
+SpeechOcean762 dataset on first run, then trains for 10 epochs saving to `runs/bge_exp1/`.
 
 ### CLI options
 
-```
-python -m models.train --help
-
-  --output-dir OUTPUT_DIR   Checkpoint and log directory  (default: runs/exp1)
-  --epochs EPOCHS           Training epochs               (default: 10)
-  --batch-size BATCH_SIZE   Training batch size           (default: 4)
-  --lr LR                   Peak AdamW learning rate      (default: 2e-5)
-  --weight-decay WEIGHT_DECAY                             (default: 0.01)
-  --num-workers NUM_WORKERS DataLoader workers            (default: 2)
-  --seed SEED               Random seed                   (default: 42)
-  --no-fp16                 Disable AMP / FP16
-  --model-name MODEL_NAME   HuggingFace HuBERT model ID
-```
+| Flag | Default | Description |
+|---|---|---|
+| `--output-dir` | `runs/bge_exp1` | Checkpoint and log directory |
+| `--epochs` | `10` | Training epochs |
+| `--batch-size` | `4` | Training batch size |
+| `--lr` | `2e-5` | Peak AdamW learning rate |
+| `--weight-decay` | `0.01` | AdamW weight decay |
+| `--num-workers` | `2` | DataLoader worker processes |
+| `--seed` | `42` | Random seed |
+| `--no-fp16` | — | Disable AMP / FP16 |
+| `--hubert-model-name` | `facebook/hubert-base-ls960` | HuggingFace HuBERT model ID |
+| `--bge-model-name` | `BAAI/bge-small-en-v1.5` | HuggingFace BGE model ID |
+| `--no-freeze-bge` | — | Unfreeze BGE encoder weights during training |
 
 ### Example runs
 
 ```bash
 # Reproduce default experiment
-python -m models.train --output-dir runs/exp1
+python -m models.train --output-dir runs/bge_exp1
 
 # Longer run on a bigger GPU
-python -m models.train --epochs 20 --batch-size 8 --output-dir runs/exp2
+python -m models.train --epochs 20 --batch-size 8 --output-dir runs/bge_exp2
+
+# Fine-tune BGE encoder as well (use carefully — risk of catastrophic forgetting)
+python -m models.train --no-freeze-bge --output-dir runs/bge_unfrozen
 
 # CPU-only / debug
 python -m models.train --no-fp16 --num-workers 0 --batch-size 2
@@ -129,18 +132,15 @@ Each run writes to `--output-dir`:
 
 ## Key Design Decisions
 
-### Phoneme vocabulary
+### BGE text branch
 
-`models/phoneme_vocab.py` defines a fixed 72-token ARPABET vocabulary:
+`models/text_embedder.py` wraps `BAAI/bge-small-en-v1.5` (hidden size 384):
 
-| Group | Count | Example |
-|---|---|---|
-| Special (`<pad>`, `<unk>`, `<sil>`) | 3 | — |
-| Vowels × 3 stress levels | 45 | `AH0`, `AH1`, `AH2` |
-| Consonants (no stress) | 24 | `B`, `CH`, `SH` |
-
-`normalize_phoneme_token` handles missing stress markers (defaults to `0`),
-silence variants (`SP`, `SIL`, `<SIL>`), and unknown tokens gracefully.
+- **Mean pooling** (not CLS): BGE is trained with mean pooling as its pooling strategy.
+- **Single sentence vector** `(B, 1, 256)`: sentence-level conditioning matches the
+  original paper design; keeps cross-attention lightweight with no padding concerns.
+- **Frozen by default**: BGE already has strong sentence representations; fine-tuning
+  on the small SpeechOcean762 dataset (5,000 utterances) risks catastrophic forgetting.
 
 ### Layer-weighted HuBERT
 
@@ -185,8 +185,8 @@ Score keys used: `accuracy`, `completeness`, `fluency`, `prosody`, `total`
 
 `utils/dataset.py` exposes:
 
-- `SpeechOcean762Dataset(split, max_audio_seconds, insert_silence)` — PyTorch Dataset
-- `collate_fn(batch)` — pads audio + phoneme sequences, emits attention/phoneme masks
+- `SpeechOcean762Dataset(split, max_audio_seconds, bge_model_name, max_text_length)` — PyTorch Dataset
+- `collate_fn(batch)` — pads audio + text token sequences, emits audio/text attention masks
 - `extract_prosody_features(audio, sr)` — returns `[rms, zcr, peak_rate, pitch_mean, pitch_std]`
 
 ---
@@ -197,11 +197,12 @@ Score keys used: `accuracy`, `completeness`, `fluency`, `prosody`, `total`
 import torch
 from models.scoring_model import HubertScoringModel
 
-ckpt = torch.load("runs/exp1/best_checkpoint.pt", map_location="cpu")
+ckpt = torch.load("runs/bge_exp1/best_checkpoint.pt", map_location="cpu")
 cfg  = ckpt["config"]
 
 model = HubertScoringModel(
-    model_name=cfg["model_name"],
+    hubert_model_name=cfg["hubert_model_name"],
+    bge_model_name=cfg["bge_model_name"],
     d_model=cfg["d_model"],
     num_heads=cfg["num_heads"],
     num_audio_transformer_layers=cfg["num_audio_transformer_layers"],
@@ -209,6 +210,7 @@ model = HubertScoringModel(
     mlp_hidden_layers=cfg["mlp_hidden_layers"],
     dropout=cfg["dropout"],
     num_unfreeze_hubert_layers=cfg["num_unfreeze_hubert_layers"],
+    freeze_bge=cfg["freeze_bge"],
 )
 model.load_state_dict(ckpt["model_state_dict"])
 model.eval()
