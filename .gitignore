@@ -10,12 +10,13 @@ __pycache__/
 venv/
 ENV/
 
-# PyTorch checkpoints — download separately, never commit large binaries
+# Model weights — download separately, never commit large binaries
 checkpoints/
 ckpt_*/
 *.pt
 *.pth
 *.bin
+*.safetensors
 
 # Jupyter
 .ipynb_checkpoints/

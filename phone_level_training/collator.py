@@ -4,7 +4,7 @@ def collate_fn(batch):
     """
     batch: list of dict
         {
-            "ssl": (T, 1024)
+            "ssl": (T, num_layers, 1024)
             "gop": (T, 1)
             "dur": (T, 1)
             "phone_ids": (T,)
@@ -15,10 +15,11 @@ def collate_fn(batch):
     B = len(batch)
     max_len = max(item["ssl"].shape[0] for item in batch)
 
-    ssl_dim = batch[0]["ssl"].shape[1]
+    num_layers = batch[0]["ssl"].shape[1]
+    ssl_dim    = batch[0]["ssl"].shape[2]
 
     # ===== allocate =====
-    ssl = torch.zeros(B, max_len, ssl_dim)
+    ssl = torch.zeros(B, max_len, num_layers, ssl_dim)
     gop = torch.zeros(B, max_len, 1)
     dur = torch.zeros(B, max_len, 1)
     phone_ids = torch.zeros(B, max_len, dtype=torch.long)

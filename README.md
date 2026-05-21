@@ -1,92 +1,301 @@
-# Pronunciation Scoring Pipeline
+# Phone-level Modeling Pipeline
 
-A two-stage pipeline for automatic pronunciation scoring using HuBERT.
+## 🎯 Overview
 
-## Pipeline Overview
+This module implements **phoneme-level pronunciation assessment** using:
 
-```
-Stage 1 — CTC Pretext Task
-  HuBERT-Large (LibriSpeech pretrained)
-       ↓  fine-tune with CTC on SpeechOcean762 transcripts
-  hubert-large-speechocean-ctc/
+* A **phoneme-level HuBERT CTC model** (pretrained separately)
+* **Forced alignment**
+* **GOP (Goodness of Pronunciation)**
+* A **Transformer-based regression model**
 
-Stage 2 — Transfer to Scoring Heads  (planned)
-  Frozen HuBERT encoder
-       ↓
-  Phoneme-level score head
-  Word-level score head
-  Utterance-level score head
+The goal is to predict:
+
+```text
+phoneme-level accuracy score ∈ [0, 2]
 ```
 
-## Repository Structure
-
-```
-pronunciation-scoring/
-├── train_hubert_speechocean.py   # Entry point — runs Stage 1 training
-├── ctc_training/
-│   ├── __init__.py
-│   ├── config.py      # Model name, dataset, paths, training hyperparameters
-│   ├── processor.py   # Text normalisation, vocab building, Wav2Vec2Processor
-│   ├── data.py        # Dataset loading (SpeechOcean762) and preprocessing
-│   ├── collator.py    # DataCollatorCTCWithPadding
-│   ├── metrics.py     # WER metric factory for HuggingFace Trainer
-│   └── model.py       # HuBERT-CTC model builder (frozen CNN encoder)
-├── requirements.txt
-└── audio/             # Sample audio files for inference / testing
-```
-
-## Stage 1 — HuBERT CTC Fine-tuning
-
-**Goal:** Fine-tune HuBERT-Large on SpeechOcean762 transcripts using CTC loss.
-The learned representations are then transferred to pronunciation scoring heads.
-
-**Dataset:** [mispeech/speechocean762](https://huggingface.co/datasets/mispeech/speechocean762)
-— 5,000 English utterances with human pronunciation scores at phoneme, word, and utterance level.
-
-**Base model:** `facebook/hubert-large-ls960-ft` (HuBERT-Large, LibriSpeech 960h)
-
-**Key design choices:**
-- CNN feature encoder is frozen; only transformer layers are fine-tuned.
-- Effective batch size 16 via gradient accumulation (4 × 4).
-- Gradient checkpointing enabled to reduce VRAM usage (~20% speed cost).
-- Best checkpoint selected by lowest validation WER.
-
-### Setup
-
-```bash
-pip install transformers datasets jiwer soundfile librosa accelerate
-# or
-pip install -r requirements.txt
-```
-
-### Run training
-
-```bash
-python train_hubert_speechocean.py
-```
-
-Outputs are saved to `./hubert-large-speechocean-ctc/`:
-- model weights and processor
-- `test_results.json` with final WER on the held-out test set
-
-### Key hyperparameters (`ctc_training/config.py`)
-
-| Parameter | Value | Notes |
-|---|---|---|
-| `num_train_epochs` | 30 | |
-| `learning_rate` | 1e-4 | linear schedule with 10% warmup |
-| `per_device_train_batch_size` | 4 | × 4 gradient accumulation = 16 effective |
-| `fp16` | auto | enabled when CUDA is available |
-| `MAX_DURATION_SEC` | 20 s | utterances longer than this are dropped |
+for each phoneme in an utterance.
 
 ---
 
-## TODO / Planned Work
+## 🧠 Pipeline Architecture
 
-- SSL masking strategies for phoneme prediction:
-  - Replace phonemes with a mask token
-  - Zero 1-dimensional features
-  - Zero multi-dimensional prosodic features
-- Transfer learning heads for phoneme, word, and utterance-level scores
-- Vowel/consonant classification auxiliary task
-- Articulation trait prediction
+```text
+Audio
+  ↓
+HuBERT (phoneme CTC)
+  ↓
+Frame-level outputs:
+    - hidden states (SSL features)
+    - log_probs (phoneme posterior)
+  ↓
+CTC Forced Alignment
+  ↓
+Frame → Phoneme mapping
+  ↓
+Feature extraction:
+    - SSL (aggregated)
+    - GOP
+    - duration
+    - phoneme embedding
+  ↓
+Transformer Encoder
+  ↓
+Phoneme-level accuracy prediction
+```
+
+---
+
+## 📦 Input Requirements
+
+Each sample from **Speechocean762** must provide:
+
+* `audio`: waveform (16kHz)
+* `words[*]["phones"]`: phoneme sequence (with stress markers)
+* `words[*]["phones-accuracy"]`: ground-truth scores
+
+---
+
+## 🔤 Phoneme Representation
+
+* Uses ARPAbet phonemes (e.g., `AA0`, `IH1`)
+* **Stress markers are preserved**
+* No G2P is required (dataset already provides phonemes)
+
+---
+
+## ⚙️ Step-by-Step Pipeline
+
+---
+
+### 1. Feature Extraction (HuBERT)
+
+Using a trained phoneme-level CTC model:
+
+```python
+ssl, log_probs = extract_ssl_and_logprob(model, input_values)
+```
+
+Outputs:
+
+* `ssl`: (T_frame, 1024)
+* `log_probs`: (T_frame, vocab_size)
+
+---
+
+### 2. Forced Alignment
+
+Align frames to phonemes:
+
+```python
+frame2phone = align(log_probs, phone_ids)
+```
+
+Output:
+
+* `frame2phone`: (T_frame,) → index of phoneme per frame
+
+---
+
+### 3. Frame → Phoneme Aggregation
+
+Aggregate SSL features:
+
+```python
+phone_ssl = aggregate_ssl(ssl, frame2phone, num_phones)
+```
+
+Output:
+
+* `phone_ssl`: (T_phone, 1024)
+
+---
+
+### 4. GOP (Goodness of Pronunciation)
+
+```python
+gop = compute_gop(log_probs, phone_ids, frame2phone)
+```
+
+Definition:
+
+```text
+GOP = log P(target phoneme) − max log P(other phonemes)
+```
+
+Output:
+
+* `gop`: (T_phone, 1)
+
+---
+
+### 5. Duration Feature
+
+```python
+dur = compute_duration(frame2phone, num_phones)
+```
+
+* Count frames per phoneme
+* Apply log scaling
+
+Output:
+
+* `dur`: (T_phone, 1)
+
+---
+
+### 6. Phoneme Embedding
+
+Trainable embedding:
+
+```python
+embedding = nn.Embedding(num_phones, 64)
+```
+
+Output:
+
+* `phone_embed`: (T_phone, 64)
+
+---
+
+### 7. Feature Fusion
+
+Concatenate all features:
+
+```text
+[SSL (1024) | GOP (1) | duration (1) | embedding (64)]
+```
+
+Final shape:
+
+```text
+(T_phone, 1090)
+```
+
+---
+
+### 8. Transformer Model
+
+* Input projection: 1090 → 256
+* 4-layer Transformer Encoder
+* Positional encoding
+
+Output:
+
+```text
+(T_phone, 1)
+```
+
+→ predicted phoneme accuracy
+
+---
+
+### 9. Loss Function
+
+Masked Mean Squared Error:
+
+```python
+loss = ((pred - target)**2 * mask).sum() / mask.sum()
+```
+
+* Ignores padding positions
+
+---
+
+## 🧪 Training Setup
+
+* Optimizer: Adam
+* Learning rate: 1e-4
+* Batch size: 2–8 (depends on GPU)
+* Epochs: 20+
+
+---
+
+## ⚠️ Critical Implementation Notes
+
+### 1. Alignment Quality
+
+* Poor CTC → bad alignment → unusable features
+* Ensure **PER < 20%** for CTC model
+
+---
+
+### 2. GOP Stability
+
+* Must be normalized:
+
+```python
+gop = (gop - mean) / std
+```
+
+* Check distribution is not constant
+
+---
+
+### 3. Padding Mask
+
+Transformer must use:
+
+```python
+src_key_padding_mask
+```
+
+---
+
+### 4. Embedding Placement
+
+* MUST be inside model (not dataset)
+* Otherwise it won’t be trained
+
+---
+
+### 5. Vocabulary Consistency
+
+Ensure:
+
+```text
+CTC vocab == dataset phonemes
+```
+
+Mismatch → invalid GOP
+
+---
+
+## 📊 Output
+
+For each utterance:
+
+```text
+[T_phone] → predicted phoneme scores
+```
+
+---
+
+## 🚀 Extensions (for research)
+
+* Replace Transformer → Conformer
+* Add word-level modeling
+* Hierarchical structure (phone → word → utterance)
+* Ordinal regression loss
+* Use mispronunciation labels
+
+---
+
+## ✅ Summary
+
+This pipeline enables:
+
+* Fully supervised phoneme-level scoring
+* Integration of acoustic + linguistic features
+* End-to-end training on real CAPT dataset
+
+---
+
+## 👨‍🔬 Research Positioning
+
+Compared to prior work:
+
+* Uses **strong phoneme supervision** (vs weak in HiPPO)
+* Explicit **GOP modeling**
+* Modular and extensible architecture
