@@ -69,7 +69,7 @@ class PhoneDataset(torch.utils.data.Dataset):
         dur = compute_duration(frame2phone, num_phones)
 
         return {
-            "ssl":       phone_ssl,
+            "ssl":       phone_ssl.cpu(),
             "gop":       gop,
             "dur":       dur,
             "phone_ids": torch.tensor(phone_ids, dtype=torch.long),

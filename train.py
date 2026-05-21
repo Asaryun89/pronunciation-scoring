@@ -1,22 +1,4 @@
 import torch
-
-# torchvision is installed but version-mismatched with torch — its __init__
-# crashes while registering fake ops for ops that don't exist in this torch build.
-# Patch register_fake to swallow those errors, import torchvision, then restore.
-_orig_register_fake = torch.library.register_fake
-def _guarded_register_fake(op, *args, **kwargs):
-    orig_dec = _orig_register_fake(op, *args, **kwargs)
-    def decorator(fn):
-        try:
-            return orig_dec(fn)
-        except RuntimeError:
-            return fn
-    return decorator
-torch.library.register_fake = _guarded_register_fake
-try:
-    import torchvision  # noqa: F401
-finally:
-    torch.library.register_fake = _orig_register_fake
 import numpy as np
 from torch.utils.data import DataLoader
 from datasets import load_dataset
@@ -40,6 +22,12 @@ def load_resources():
         ignore_mismatched_sizes=True,
     ).to(DEVICE)
     hubert.eval()
+
+    nan_layers = [n for n, p in hubert.named_parameters() if p.isnan().any()]
+    if nan_layers:
+        print(f"[warn] HuBERT checkpoint has NaN weights in {len(nan_layers)} tensors "
+              f"(e.g. {nan_layers[0]}). SSL features will be zeroed — "
+              "retrain or replace the checkpoint in hubert_phoneme_ctc/.")
 
     return hubert, phone2id
 
@@ -165,7 +153,13 @@ def train(
                 pred = model(ssl, gop, dur, phone_ids, mask)
                 loss = masked_mse(pred, scores, mask)
 
+            if torch.isnan(loss):
+                print(f"\n  [warn] NaN loss at batch — skipping")
+                continue
+
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 

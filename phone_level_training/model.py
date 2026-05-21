@@ -84,8 +84,7 @@ class PhoneModel(nn.Module):
             mask:      (B, T)   bool, True = valid token
 
         Returns:
-            (B, T) predicted per-phoneme accuracy scores in [0, 1]
-            (multiply by PHONE_SCALE=2 for display)
+            (B, T) predicted per-phoneme accuracy scores (target scale 0–2, unbounded linear output)
         """
         parts = []
         if self.use_ssl:

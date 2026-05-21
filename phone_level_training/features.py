@@ -17,6 +17,7 @@ def extract_ssl_and_logprob(model, input_values):
         logits = out.logits.squeeze(0)
         log_probs = torch.log_softmax(logits, dim=-1)
 
+    ssl = ssl.nan_to_num(0.0)
     return ssl, log_probs
 
 
@@ -32,6 +33,7 @@ def aggregate_ssl(ssl, frame2phone, num_phones):
     Returns:
         (num_phones, num_layers, 1024)
     """
+    frame2phone = frame2phone.to(ssl.device)
     num_layers, _, ssl_dim = ssl.shape
     out = []
     for i in range(num_phones):
