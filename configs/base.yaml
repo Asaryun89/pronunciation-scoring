@@ -1,0 +1,56 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-resolution HuBERT — base config  (fine-tuning on Speechocean762)
+#
+# Architecture (matches diagram):
+#   f0  CNN feature extractor  →  H̃0  (masked CNN features)
+#   f1  High-res transformer   (layers 0-3)
+#   ↓   Downsampling module    (stride 2)
+#   f2  Low-res  transformer   (layers 4-7)
+#   ↑   Upsampling module      (stride 2, + skip from f1)
+#   f3  High-res transformer   (layers 8-11)
+#       Score head             (pool H3 + H2 → 5 MOS dimensions)
+# ─────────────────────────────────────────────────────────────────────────────
+
+data:
+  train_dir:      "data/SPEECHOCEAN762/train"
+  val_dir:        "data/SPEECHOCEAN762/test"
+  scores_path:    "data/SPEECHOCEAN762/resource/scores.json"
+  max_duration_s: 20.0
+  augment:        true
+  num_workers:    4
+  batch_size:     16
+
+model:
+  hubert_model_name:        "facebook/hubert-base-ls960"  # 12 transformer layers
+  # Layer split: f1_count + f2_count + f3_count must equal 12
+  f1_layer_count:           4          # High-res encoder (frozen)
+  f2_layer_count:           4          # Low-res  encoder
+  f3_layer_count:           4          # High-res encoder (fine-tuned)
+  downsample_stride:        2          # DOWN / UP stride factor
+  freeze_feature_extractor: true       # freeze CNN f0
+  freeze_f1_layers:         true       # freeze f1 (pretrained low-level features)
+  # Feature masking (used only during self-supervised pre-training; no-op here)
+  mask_prob:                0.065
+  mask_length:              10
+  # Unit-prediction vocabulary sizes (pre-training only, ignored in fine-tuning)
+  num_units_hi:             100
+  num_units_lo:             50
+  # Score regression head
+  fusion_hidden:            512
+  n_scores:                 5          # accuracy, fluency, completeness, prosodic, total
+  dropout:                  0.1
+  pretrain:                 false      # true = unit-prediction mode
+
+training:
+  output_dir:    "checkpoints/base"
+  epochs:        30
+  learning_rate: 1.0e-4
+  weight_decay:  1.0e-2
+  warmup_epochs: 2
+  grad_clip:     1.0
+  log_every:     50
+  eval_every:    1
+  save_best:     true
+  score_weights: [1.0, 1.0, 1.0, 1.0, 2.0]  # upweight 'total' dimension
+  mse_weight:    1.0
+  corr_weight:   0.5

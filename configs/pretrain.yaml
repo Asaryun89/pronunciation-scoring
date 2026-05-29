@@ -1,0 +1,107 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-resolution HuBERT — Pre-training config
+#
+# Stage 1 of 2:  self-supervised masked unit prediction
+#
+# Workflow:
+#   1.  python pretrain.py --config configs/pretrain.yaml --prepare-kmeans
+#       → fits k-means on MFCC features, saves labels
+#   2.  python pretrain.py --config configs/pretrain.yaml
+#       → runs self-supervised pre-training
+#   (optional) repeat with kmeans.iteration=2 using a model checkpoint
+# ─────────────────────────────────────────────────────────────────────────────
+
+data:
+  hf_dataset_id:  "mispeech/speechocean762"
+  train_split:    "train"
+  labels_path:    "../data/kmeans/labels_iter1.pkl"
+  kmeans_path:    "../data/kmeans/kmeans_iter1.pkl"
+  max_duration_s: 20.0   # caps attention memory; SpeechOcean762 avg ~7 s
+  batch_size:     8     # 4 per GPU if 2x A4000; 8 on single GPU with short seqs
+  num_workers:    8
+
+kmeans:
+  iteration:          1          # 1 = MFCC features, 2 = model (f1) features
+  model_checkpoint:   null       # required for iteration=2
+  n_clusters_hi:      100        # vocabulary size for g^q_R1 (high-res head)
+  n_clusters_lo:      null       # null → decimate hi labels; set int for separate lo k-means
+  n_mfcc:             39         # MFCC dimensions (iter 1 only)
+  cnn_stride:         320        # HuBERT base CNN total stride (samples per frame)
+
+model:
+  hubert_model_name:        "facebook/hubert-large-ll60k"
+  # Transformer layer split: f1 + f2 + f3 must equal num_hidden_layers (24)
+  f1_layer_count:           8
+  f2_layer_count:           8
+  f3_layer_count:           8
+  downsample_stride:        2
+  # During pre-training, train everything
+  freeze_feature_extractor: false
+  freeze_f1_layers:         false
+  # Feature masking (applied at H0)
+  mask_prob:                0.065  # probability of starting a masked span
+  mask_length:              10     # frames per masked span
+  # Unit-prediction vocabulary sizes
+  num_units_hi:             100    # must match kmeans.n_clusters_hi
+  num_units_lo:             100    # used only if pretrain=true; same as hi if no separate lo kmeans
+  # Fine-tuning head (not used during pre-training)
+  fusion_hidden:            512
+  n_scores:                 5
+  dropout:                  0.1
+  pretrain:                 true   # MUST be true for pre-training
+
+training:
+  output_dir:       "../checkpoints/pretrain"
+  overwrite:        true
+
+  epochs:           100             # ← was 50; too early to stop
+  learning_rate:    1.0e-4
+  min_lr:           1.0e-6
+  lr_scheduler:     "cosine"
+  warmup_steps:     6240            # ← was 1000; now 20% of total steps
+
+  optimizer:        "adamw"
+  weight_decay:     1.0e-2
+  betas:            [0.9, 0.98]
+
+  grad_clip:        0.5
+  use_amp:          true
+  device:           "cuda"
+
+  hi_loss_weight:   1.0
+  lo_loss_weight:   1.0
+
+  log_every:              50
+  save_best_only:         false     # ← was true; need recovery checkpoints
+  save_every:             1560      # ← now active (~5 epochs)
+  keep_last_n_checkpoints: 3
+
+  early_stopping:         true
+  patience:               15
+  min_delta:              0.005
+
+
+logging:
+  use_wandb:   false               # set true and pip install wandb to enable
+  use_tb:      true
+  tb_log_dir:  "../logs/pretrain"
+  project:     "multi-res-hubert"
+  run_name:    "pretrain-iter1"
+
+sync:
+  enabled:   false
+  method:    "rclone"
+
+  # Checkpoint destination on Google Drive
+  rclone_remote:  "gdrive:hubert/checkpoints/pretrain/"
+  rclone_args:    ""
+
+  # Log directory destination on Google Drive (metrics.csv, train.log, config.yaml)
+  log_remote:     "gdrive:hubert/logs/pretrain/"
+
+  # Delete checkpoint from server disk after a successful upload
+  delete_after:   true
+
+  # Common
+  timeout_s:      600     # large model files can take a while
+  max_retries:    3
