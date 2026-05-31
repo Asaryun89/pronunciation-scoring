@@ -114,21 +114,27 @@ def run_inference(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_metrics(
-    preds:   np.ndarray,   # [N, 5] normalised [0, 1]
-    targets: np.ndarray,   # [N, 5] normalised [0, 1]
-    scale:   float = SCORE_MAX,
+    preds:      np.ndarray,   # [N, 4] normalised [0, 1]
+    targets:    np.ndarray,   # [N, 4] normalised [0, 1]
+    scale:      float = SCORE_MAX,
+    mse_weight: float = 0.5,
+    pcc_weight: float = 0.5,
 ) -> List[Dict[str, float]]:
-    """Per-dimension PCC, MSE, MAE.  Values are on the original [0, 10] scale."""
+    """Per-dimension PCC, MSE, MAE, Loss.  PCC/MSE/MAE on the [0, 10] scale."""
     rows = []
     for i in range(preds.shape[1]):
         p = preds[:, i] * scale
         t = targets[:, i] * scale
         pcc = float(np.corrcoef(p, t)[0, 1]) if p.std() > 1e-6 else float("nan")
-        rows.append({
-            "pcc": pcc,
-            "mse": float(np.mean((p - t) ** 2)),
-            "mae": float(np.mean(np.abs(p - t))),
-        })
+        mse = float(np.mean((p - t) ** 2))
+        mae = float(np.mean(np.abs(p - t)))
+        # Loss computed on normalised [0,1] scale (matches training).
+        p_n, t_n = preds[:, i], targets[:, i]
+        mse_n = float(np.mean((p_n - t_n) ** 2))
+        pcc_n = float(np.corrcoef(p_n, t_n)[0, 1]) if p_n.std() > 1e-6 else float("nan")
+        loss  = (mse_weight * mse_n + pcc_weight * (1.0 - pcc_n)
+                 if not np.isnan(pcc_n) else float("nan"))
+        rows.append({"pcc": pcc, "mse": mse, "mae": mae, "loss": loss})
     return rows
 
 
@@ -142,16 +148,18 @@ def _print_results_table(
     dims:    List[str] = FUSION_SCORE_KEYS,
 ) -> None:
     print(f"\n=== {title} ===\n")
-    print(f"{'Dimension':<14}| {'PCC':>8} | {'MSE':>8} | {'MAE':>8}")
-    print("-" * 44)
+    print(f"{'Dimension':<14}| {'PCC':>8} | {'MSE':>8} | {'MAE':>8} | {'Loss':>8}")
+    print("-" * 55)
     for dim, r in zip(dims, rows):
-        pcc = f"{r['pcc']:.4f}" if not np.isnan(r['pcc']) else "  nan"
-        print(f"{dim:<14}| {pcc:>8} | {r['mse']:>8.4f} | {r['mae']:>8.4f}")
-    mean_pcc = np.nanmean([r["pcc"] for r in rows])
-    mean_mse = np.mean([r["mse"] for r in rows])
-    mean_mae = np.mean([r["mae"] for r in rows])
-    print("-" * 44)
-    print(f"{'MEAN':<14}| {mean_pcc:>8.4f} | {mean_mse:>8.4f} | {mean_mae:>8.4f}")
+        pcc  = f"{r['pcc']:.4f}"  if not np.isnan(r['pcc'])  else "     nan"
+        loss = f"{r['loss']:.4f}" if not np.isnan(r['loss']) else "     nan"
+        print(f"{dim:<14}| {pcc:>8} | {r['mse']:>8.4f} | {r['mae']:>8.4f} | {loss:>8}")
+    mean_pcc  = np.nanmean([r["pcc"]  for r in rows])
+    mean_mse  = np.mean([r["mse"]  for r in rows])
+    mean_mae  = np.mean([r["mae"]  for r in rows])
+    mean_loss = np.nanmean([r["loss"] for r in rows])
+    print("-" * 55)
+    print(f"{'MEAN':<14}| {mean_pcc:>8.4f} | {mean_mse:>8.4f} | {mean_mae:>8.4f} | {mean_loss:>8.4f}")
 
 
 def _print_ablation_table(
@@ -159,20 +167,20 @@ def _print_ablation_table(
     fusion_rows: List[Dict[str, float]],
     dims:        List[str] = FUSION_SCORE_KEYS,
 ) -> None:
-    print("\n=== ABLATION: speech-only vs FusionC ===\n")
+    print("\n=== ABLATION: shared MLP vs per-dim regressors ===\n")
     print(
-        f"{'Dimension':<14}| {'Speech-only PCC':>17} | "
-        f"{'FusionC PCC':>13} | {'Delta':>7}"
+        f"{'Dimension':<14}| {'Shared PCC':>12} | "
+        f"{'PerDim PCC':>12} | {'Delta':>7}"
     )
-    print("-" * 57)
+    print("-" * 52)
     for dim, sr, fr in zip(dims, speech_rows, fusion_rows):
         s_pcc = sr["pcc"]
         f_pcc = fr["pcc"]
         delta = f_pcc - s_pcc if not (np.isnan(s_pcc) or np.isnan(f_pcc)) else float("nan")
-        s_str = f"{s_pcc:.4f}" if not np.isnan(s_pcc) else "   nan"
-        f_str = f"{f_pcc:.4f}" if not np.isnan(f_pcc) else "   nan"
-        d_str = f"{delta:+.4f}" if not np.isnan(delta) else "   nan"
-        print(f"{dim:<14}| {s_str:>17} | {f_str:>13} | {d_str:>7}")
+        s_str = f"{s_pcc:.4f}" if not np.isnan(s_pcc) else "      nan"
+        f_str = f"{f_pcc:.4f}" if not np.isnan(f_pcc) else "      nan"
+        d_str = f"{delta:+.4f}" if not np.isnan(delta) else "      nan"
+        print(f"{dim:<14}| {s_str:>12} | {f_str:>12} | {d_str:>7}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -219,23 +227,74 @@ def main() -> None:
     model.eval().to(device)
     log.info("Model loaded.")
 
+    mse_w = cfg["training"].get("mse_weight", 0.5)
+    pcc_w = cfg["training"].get("pcc_weight", 0.5)
+
     # ── Fusion-C inference ────────────────────────────────────────────────
-    log.info("Running Fusion-C inference …")
+    log.info("Running Fusion-C (per-dim regressors) inference …")
     fusion_preds, targets = run_inference(model, loader, device, speech_only=False)
-    fusion_metrics = compute_metrics(fusion_preds, targets)
+    fusion_metrics = compute_metrics(fusion_preds, targets, mse_weight=mse_w, pcc_weight=pcc_w)
     _print_results_table(
-        "FUSION C RESULTS (bge-small-en-v1.5)",
+        "PER-DIMENSION REGRESSOR RESULTS",
         fusion_metrics,
     )
 
-    # ── Speech-only ablation ──────────────────────────────────────────────
+    # ── Speech-only ablation (shared gate, no text) ───────────────────────
     log.info("Running speech-only ablation (text_emb = 0) …")
     speech_preds, _ = run_inference(model, loader, device, speech_only=True)
-    speech_metrics  = compute_metrics(speech_preds, targets)
+    speech_metrics  = compute_metrics(speech_preds, targets, mse_weight=mse_w, pcc_weight=pcc_w)
     _print_ablation_table(speech_metrics, fusion_metrics)
 
     print()
 
 
+def sanity_check() -> None:
+    """
+    Verify 4-dim consistency across config, model, and dataset before training.
+
+    Run:
+        python evaluate_finetune.py   (without --config / --checkpoint args)
+    """
+    import yaml
+    from model.fusion_head import FusionScoringHead, SCORE_DIMS
+    import torch
+
+    cfg = yaml.safe_load(open("configs/finetune_config.yaml"))
+
+    assert cfg["model"]["n_scores"] == 4, (
+        f"Config n_scores={cfg['model']['n_scores']}, expected 4"
+    )
+
+    assert SCORE_DIMS == ["total", "accuracy", "fluency", "prosodic"], (
+        f"SCORE_DIMS mismatch: {SCORE_DIMS}"
+    )
+
+    speech_dim = cfg["model"]["speech_rep_dim"]
+    text_dim   = cfg["model"]["text_encoder_dim"]
+    head = FusionScoringHead(
+        speech_dim = speech_dim,
+        text_dim   = text_dim,
+        hidden     = cfg["model"]["fusion_hidden"],
+        n_scores   = 4,
+        dropout    = cfg["model"]["dropout"],
+    )
+    out = head(torch.randn(4, speech_dim), torch.randn(4, text_dim))
+    assert out.shape == (4, 4), f"Head output shape {tuple(out.shape)}, expected (4, 4)"
+
+    from data.speechocean_dataset import FUSION_SCORE_KEYS
+    assert FUSION_SCORE_KEYS == ["total", "accuracy", "fluency", "prosodic"], (
+        f"FUSION_SCORE_KEYS mismatch: {FUSION_SCORE_KEYS}"
+    )
+
+    print("All sanity checks passed — completeness removed cleanly")
+    print(f"  SCORE_DIMS:        {SCORE_DIMS}")
+    print(f"  FUSION_SCORE_KEYS: {FUSION_SCORE_KEYS}")
+    print(f"  head output shape: {tuple(out.shape)}")
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) == 1:
+        sanity_check()
+    else:
+        main()

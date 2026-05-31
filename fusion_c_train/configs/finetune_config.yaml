@@ -10,7 +10,7 @@ data:
   train_split:        "train"
   test_split:         "test"
   max_duration_s:     20.0
-  batch_size:         16
+  batch_size:         4
   num_workers:        4
   transcript_field:   "text"
 
@@ -43,8 +43,7 @@ model:
 
   # Fusion head
   fusion_hidden:        512
-  n_scores:             4   # completeness removed — skewed distribution
-                            # causes persistent low PCC; excluded from training
+  n_scores:             5
   dropout:              0.1
   gate_fusion:          true
 

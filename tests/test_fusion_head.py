@@ -16,13 +16,13 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from model.fusion_head import FusionScoringHead
+from model.fusion_head import SCORE_DIMS, FusionScoringHead
 
 # Default dims matching finetune_config.yaml
 SPEECH_DIM = 1024
 TEXT_DIM   = 384
 HIDDEN     = 512
-N_SCORES   = 5
+N_SCORES   = 4
 DROPOUT    = 0.1
 BATCH      = 8
 
@@ -48,6 +48,8 @@ def _dummy_inputs(
     return speech_rep, text_emb
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Existing tests (must still pass)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_output_shape(head: FusionScoringHead) -> None:
@@ -79,7 +81,7 @@ def test_gate_values_in_0_1(head: FusionScoringHead) -> None:
 def test_gradient_flows_into_head_params(head: FusionScoringHead) -> None:
     """
     A backward pass through the head must populate gradients in both the
-    gate projection and the MLP parameters.
+    gate projection and at least one per-dimension regressor.
     """
     head.train()
     sr, te = _dummy_inputs()
@@ -94,12 +96,12 @@ def test_gradient_flows_into_head_params(head: FusionScoringHead) -> None:
     assert gate_grad is not None, "gate_proj.weight has no gradient after backward"
     assert gate_grad.abs().sum().item() > 0, "gate_proj.weight gradient is all zeros"
 
-    # Check at least one MLP linear layer has a gradient.
-    for module in head.mlp:
-        if hasattr(module, "weight") and module.weight.grad is not None:
-            if module.weight.grad.abs().sum().item() > 0:
-                return   # found a live gradient
-    pytest.fail("No MLP weight has a non-zero gradient after backward.")
+    # At least one parameter across all regressors must have a non-zero gradient.
+    for name in head.dim_names:
+        for p in head.regressors[name].parameters():
+            if p.grad is not None and p.grad.abs().sum().item() > 0:
+                return
+    pytest.fail("No regressor weight has a non-zero gradient after backward.")
 
 
 def test_gradient_does_not_flow_into_detached_inputs(
@@ -136,3 +138,54 @@ def test_score_dim_count(head: FusionScoringHead) -> None:
     sr, te = _dummy_inputs()
     out    = head(sr, te)
     assert out.shape[-1] == 5, f"Expected 5 score dims, got {out.shape[-1]}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# New tests for per-dimension architecture
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_per_dim_independent_gradients(head: FusionScoringHead) -> None:
+    """
+    Backpropagating through a single regressor must leave all other
+    regressors' parameters with grad=None.  This proves independence.
+    """
+    head.train()
+    sr, te = _dummy_inputs()
+
+    # Compute shared fused representation manually.
+    concat = torch.cat([sr, te], dim=-1)
+    fused  = torch.sigmoid(head.gate_proj(concat)) * concat
+
+    head.zero_grad()
+
+    # Only run the "total" regressor — others are never called.
+    score = head.regressors["total"](fused)
+    score.sum().backward()
+
+    assert any(
+        p.grad is not None and p.grad.abs().sum().item() > 0
+        for p in head.regressors["total"].parameters()
+    ), "total regressor has no gradient after backward"
+
+    for name in ["accuracy", "fluency", "prosodic"]:
+        for p in head.regressors[name].parameters():
+            assert p.grad is None, (
+                f"'{name}' regressor unexpectedly has gradient "
+                f"(independence violated)"
+            )
+
+
+def test_output_bounded(head: FusionScoringHead) -> None:
+    """All outputs must be strictly within [0.0, 1.0] for varied inputs."""
+    for _ in range(100):
+        sr = torch.randn(BATCH, SPEECH_DIM) * 5.0  # large magnitude stress test
+        te = torch.randn(BATCH, TEXT_DIM)   * 5.0
+        out = head(sr, te)
+        assert out.min().item() >= 0.0, f"output below 0: {out.min().item()}"
+        assert out.max().item() <= 1.0, f"output above 1: {out.max().item()}"
+
+
+def test_dim_names_order(head: FusionScoringHead) -> None:
+    """dim_names must match SCORE_DIMS in fixed canonical order."""
+    assert head.dim_names == SCORE_DIMS
+    assert head.dim_names == ["total", "accuracy", "fluency", "prosodic"]

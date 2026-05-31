@@ -1,86 +1,46 @@
 data:
   hf_dataset_id:    "mispeech/speechocean762"
   train_split:      "train"
-  test_split:       "test"
+  val_split:        "test"
   max_duration_s:   20.0
-  batch_size:       16             # smaller sequences than pre-train → larger batch
+  batch_size:       16
   num_workers:      4
-
-  # Text path
-  transcript_field: "text"         # column name in speechocean762
-  phoneme_backend:  "g2p_en"       # G2P library for phoneme conversion
-  text_encoder_mode: "bert"        # "bert" | "gru"
+  augment:          true
 
 model:
-  # Pre-trained speech encoder
-  pretrain_checkpoint: "../checkpoints/pretrain/best_model.pt"
-  hubert_model_name:   "facebook/hubert-large-ll60k"
-  f1_layer_count:      8
-  f2_layer_count:      8
-  f3_layer_count:      8
-  downsample_stride:   2
-  pretrain:            false        # switches model to fine-tuning mode
-
-  # Masking OFF during fine-tuning
-  mask_prob:           0.0
-  mask_length:         0
-
-  # Freeze strategy — staged unfreezing
-  freeze_feature_extractor: true    # CNN always frozen
-  freeze_f1_layers:         false   # fine-tune transformers
-  freeze_f2_layers:         false
-  freeze_f3_layers:         false
-
-  # Text encoder
-  text_encoder_mode:   "bert"       # frozen BERT [CLS] embedding
-  text_encoder_dim:    768          # BERT-base output dim
-  freeze_text_encoder: true         # freeze BERT, only train fusion head
-
-  # Fusion C scoring head
-  fusion_hidden:       512
-  n_scores:            5            # total, accuracy, fluency, prosodic, completeness
-  dropout:             0.1
-  gate_fusion:         true         # gated concat layer
+  hubert_model_name:        "facebook/hubert-large-ll60k"
+  f1_layer_count:           8
+  f2_layer_count:           8
+  f3_layer_count:           8
+  downsample_stride:        2
+  pretrain:                 false
+  mask_prob:                0.0
+  mask_length:              0
+  freeze_feature_extractor: true
+  freeze_f1_layers:         false
+  fusion_hidden:            512
+  n_scores:                 5
+  dropout:                  0.1
 
 training:
   output_dir:     "../checkpoints/finetune"
   epochs:         50
-  
-  # Differential learning rates — speech encoder needs gentler updates
-  lr_speech_encoder:  5.0e-5        # fine-tune transformers carefully
-  lr_fusion_head:     1.0e-4        # fusion head trains faster
-  lr_text_encoder:    0.0           # frozen BERT — no updates
-
-  min_lr:             1.0e-6
-  lr_scheduler:       "cosine"
-  warmup_steps:       500           # short warmup — starting from pre-trained weights
-
-  optimizer:          "adamw"
-  weight_decay:       1.0e-2
-  betas:              [0.9, 0.98]
-  grad_clip:          1.0
-  use_amp:            true
-  device:             "cuda"
-
-  # Loss: MSE + PCC combined per dimension
-  mse_weight:         0.5
-  pcc_weight:         0.5
-
-  # Checkpointing
-  save_every_n_epochs:      5
-  keep_last_n_checkpoints:  3
-  best_metric:              "val_pcc_total"   # save best by overall PCC
-
-  # Early stopping
-  early_stopping:     true
-  patience:           10
-  min_delta:          0.001
-
-  log_every:          20
+  learning_rate:  1.0e-4
+  weight_decay:   1.0e-2
+  warmup_steps:   500
+  grad_clip:      1.0
+  use_amp:        true
+  device:         "cuda"
+  mse_weight:     1.0
+  corr_weight:    0.5
+  score_weights:  [1.0, 1.0, 1.0, 1.0, 2.0]
+  log_every:      50
+  eval_every:     1
+  save_best:      true
 
 logging:
   use_wandb:    false
   use_tb:       true
   tb_log_dir:   "../logs/finetune"
   project:      "multi-res-hubert"
-  run_name:     "finetune-fusionC-utterance"
+  run_name:     "finetune-base"

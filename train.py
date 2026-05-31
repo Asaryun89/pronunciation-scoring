@@ -13,6 +13,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import inspect
 import logging
 import sys
 from pathlib import Path
@@ -110,11 +111,15 @@ def main() -> None:
     cfg = load_config(args.config)
 
     logger.info("Building data loaders …")
-    train_loader = build_loader(cfg, cfg["data"]["train_split"], augment=cfg["data"]["augment"])
-    val_loader   = build_loader(cfg, cfg["data"]["val_split"],   augment=False)
+    data_cfg     = cfg["data"]
+    val_split    = data_cfg.get("val_split") or data_cfg.get("test_split", "test")
+    train_loader = build_loader(cfg, data_cfg["train_split"], augment=data_cfg.get("augment", True))
+    val_loader   = build_loader(cfg, val_split,               augment=False)
 
     logger.info("Building model: %s", cfg["model"]["hubert_model_name"])
-    model = MultiResHuBERT(**cfg["model"])
+    _valid_model_params = set(inspect.signature(MultiResHuBERT.__init__).parameters) - {"self"}
+    model_kwargs = {k: v for k, v in cfg["model"].items() if k in _valid_model_params}
+    model = MultiResHuBERT(**model_kwargs)
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total     = sum(p.numel() for p in model.parameters())
     logger.info("  trainable: %.1fM / %.1fM params (%.1f%%)",
@@ -122,7 +127,11 @@ def main() -> None:
                 100 * n_trainable / n_total)
 
     # Warm-start from a pre-training checkpoint (only backbone weights)
-    pretrained_path = args.pretrained or cfg.get("pretrained_checkpoint")
+    pretrained_path = (
+        args.pretrained
+        or cfg.get("pretrained_checkpoint")
+        or cfg.get("model", {}).get("pretrain_checkpoint")
+    )
     if pretrained_path:
         ckpt = torch.load(pretrained_path, map_location="cpu")
         missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
