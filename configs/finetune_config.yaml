@@ -1,7 +1,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Multi-resolution HuBERT — Fusion C Fine-tuning Config
 #
-# Architecture:  MultiResHuBERT (speech) + BGE-small (text) → FusionScoringHead
+# Architecture:  MultiResHuBERT (speech) + Qwen3-Embedding-0.6B (text) → FusionScoringHead
 # Dataset:       mispeech/speechocean762 (utterance-level pronunciation scoring)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -10,7 +10,7 @@ data:
   train_split:        "train"
   test_split:         "test"
   max_duration_s:     20.0
-  batch_size:         16
+  batch_size:         32        # was 16; larger batch reduces gradient variance
   num_workers:        4
   transcript_field:   "text"
 
@@ -35,11 +35,17 @@ model:
   num_units_hi:             100
   num_units_lo:             100
 
-  # Text encoder — BGE-small
-  text_encoder_name:    "BAAI/bge-small-en-v1.5"
-  text_encoder_dim:     384          # bge-small [CLS] output dimension
-  freeze_text_encoder:  true         # frozen — no gradient through BGE
-  text_max_length:      128
+  # Text encoder — Qwen3-Embedding-0.6B
+  # Notes:
+  #   - decoder-only: last-token pooling (NOT [CLS])
+  #   - tokenizer requires padding_side="left"
+  #   - output 1024-dim, L2-normalized, float32
+  #   - requires transformers>=4.51.0
+  #   - INCOMPATIBLE with previous encoder checkpoints (fusion concat dim changed)
+  text_encoder_name:    "Qwen/Qwen3-Embedding-0.6B"
+  text_encoder_dim:     1024         # last-token output dim
+  freeze_text_encoder:  true         # start frozen; unfreeze with lr_text_encoder=1e-5
+  text_max_length:      128          # transcripts are short; 128 is sufficient
 
   # Fusion head
   fusion_hidden:        512
@@ -53,10 +59,10 @@ training:
   epochs:                   50
   lr_speech_encoder:        5.0e-5   # param group A
   lr_fusion_head:           1.0e-4   # param group B
-  lr_text_encoder:          0.0      # param group C (frozen — no gradient)
-  min_lr:                   1.0e-6
+  lr_text_encoder:          1.0e-5   # was 0.0; gentle Qwen3 fine-tune for accuracy
+  min_lr:                   1.0e-5   # was 1.0e-6; LR floor was decaying too fast
   lr_scheduler:             "cosine"
-  warmup_steps:             500
+  warmup_steps:             1000     # was 500; slower ramp-up avoids early overshoot
   optimizer:                "adamw"
   weight_decay:             1.0e-2
   betas:                    [0.9, 0.98]
@@ -71,13 +77,15 @@ training:
   early_stopping:           true
   patience:                 10
   min_delta:                0.001
+  grad_accumulation_steps:  2        # NEW; effective batch = 32 × 2 = 64
+  label_smooth_alpha:       0.05     # NEW; dampens noisy batch outliers
   log_every:                20       # optimizer steps between step-level log writes
 
 logging:
   use_wandb:    false
   use_tb:       true
   tb_log_dir:   "../logs/finetune"
-  run_name:     "finetune-fusionC-bge-small"
+  run_name:     "finetune-fusionC-qwen3-emb"
 
 sync:
   enabled:   false      # set true to auto-push checkpoints to your local machine

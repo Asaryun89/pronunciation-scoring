@@ -1,10 +1,10 @@
 """
 Full Fusion-C fine-tuning wrapper for Multi-resolution HuBERT.
 
-Loads a pre-trained MultiResHuBERT backbone, attaches a frozen BGETextEncoder
+Loads a pre-trained MultiResHuBERT backbone, attaches a Qwen3TextEncoder
 and a trainable FusionScoringHead, and exposes a unified forward pass:
 
-    scores = model(waveforms, attention_mask, transcripts)   # [B, 5]
+    scores = model(waveforms, attention_mask, transcripts)   # [B, 4]
 
 Standalone import:
     from model.multireshubert_finetune import MultiResHuBERTFinetune
@@ -23,7 +23,7 @@ from torch import Tensor
 from torch.optim import AdamW
 
 from .multi_res_hubert import MultiResHuBERT
-from .text_encoder import BGETextEncoder
+from .text_encoder import Qwen3TextEncoder
 from .fusion_head import FusionScoringHead
 
 log = logging.getLogger(__name__)
@@ -48,10 +48,10 @@ class MultiResHuBERTFinetune(nn.Module):
 
     Speech path  : MultiResHuBERT backbone (loaded from pretrain checkpoint)
                    → mean-pool f₃ output → speech_rep [B, speech_rep_dim]
-    Text path    : BGETextEncoder (frozen)
-                   → [CLS] L2-normalised → text_emb [B, text_encoder_dim]
+    Text path    : Qwen3TextEncoder (frozen or fine-tuneable)
+                   → last-token L2-normalised → text_emb [B, 1024]
     Fusion       : FusionScoringHead (trainable)
-                   → scores [B, 5] in (0, 1)
+                   → scores [B, 4] in (0, 1)
 
     Args:
         cfg: Parsed YAML config dict (full config, not just model section).
@@ -115,12 +115,18 @@ class MultiResHuBERTFinetune(nn.Module):
             _freeze(self.speech_model.f3_layers)
             log.info("f3_layers frozen.")
 
-        # ── Text encoder (always frozen) ──────────────────────────────────
-        self.text_encoder = BGETextEncoder(
+        # ── Text encoder (Qwen3; frozen unless freeze_text_encoder=false) ─
+        # Output dim: 1024 (last-token pooled, float32)
+        # Fusion concat: speech_rep_dim + 1024
+        freeze_text = mcfg.get("freeze_text_encoder", True)
+        self.text_encoder = Qwen3TextEncoder(
             model_name = mcfg["text_encoder_name"],
             max_length  = mcfg.get("text_max_length", 128),
+            frozen     = freeze_text,
         )
-        _freeze(self.text_encoder)
+        if not freeze_text:
+            log.info("Qwen3 text encoder is UNFROZEN — gradients will flow (lr=%.1e).",
+                     tcfg.get("lr_text_encoder", 0.0))
 
         # ── Fusion scoring head (always trainable) ────────────────────────
         self.fusion_head = FusionScoringHead(
@@ -158,8 +164,8 @@ class MultiResHuBERTFinetune(nn.Module):
             speech_only:    If True, replace text_emb with zeros (ablation).
 
         Returns:
-            scores: [B, 5] in (0, 1) — [total, accuracy, fluency,
-                    prosodic, completeness]
+            scores: [B, 4] in (0, 1) — [total, accuracy, fluency,
+                    prosodic]
         """
         # ── Speech encoding ───────────────────────────────────────────────
         out = self.speech_model(
@@ -189,7 +195,7 @@ class MultiResHuBERTFinetune(nn.Module):
             )
 
         # ── Fusion → scores ───────────────────────────────────────────────
-        return self.fusion_head(speech_rep, text_emb)   # [B, 5]
+        return self.fusion_head(speech_rep, text_emb)   # [B, 4]
 
     # ──────────────────────────────────────────────────────────────────────
     # Optimizer
@@ -200,20 +206,22 @@ class MultiResHuBERTFinetune(nn.Module):
         Returns an AdamW with three parameter groups:
           A — speech encoder (backbone):  lr = lr_speech_encoder
           B — fusion scoring head:        lr = lr_fusion_head
-          C — text encoder:               lr = lr_text_encoder  (0.0 → frozen)
+          C — text encoder:               lr = lr_text_encoder
+                                          (0.0 when frozen, 1e-5 when unfrozen)
         """
         speech_params = [
             p for p in self.speech_model.parameters() if p.requires_grad
         ]
         fusion_params = list(self.fusion_head.parameters())
-        text_params   = list(self.text_encoder.parameters())   # all frozen
+        text_params   = list(self.text_encoder.parameters())
 
         log.info(
             "Optimizer param groups: speech=%d params | fusion=%d params | "
-            "text=%d params (lr=0.0)",
+            "text=%d params (lr=%.1e)",
             sum(p.numel() for p in speech_params),
             sum(p.numel() for p in fusion_params),
             sum(p.numel() for p in text_params),
+            self._lr_text,
         )
 
         return AdamW(

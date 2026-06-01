@@ -20,7 +20,7 @@ from model.fusion_head import SCORE_DIMS, FusionScoringHead
 
 # Default dims matching finetune_config.yaml
 SPEECH_DIM = 1024
-TEXT_DIM   = 384
+TEXT_DIM   = 1024
 HIDDEN     = 512
 N_SCORES   = 4
 DROPOUT    = 0.1
@@ -53,7 +53,7 @@ def _dummy_inputs(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_output_shape(head: FusionScoringHead) -> None:
-    """Output must be [B, 5]."""
+    """Output must be [B, 4]."""
     sr, te = _dummy_inputs()
     out    = head(sr, te)
     assert out.shape == (BATCH, N_SCORES), (
@@ -134,10 +134,10 @@ def test_batch_size_one(head: FusionScoringHead) -> None:
 
 
 def test_score_dim_count(head: FusionScoringHead) -> None:
-    """Verify that head was built for exactly N_SCORES = 5 outputs."""
+    """Verify that head was built for exactly N_SCORES = 4 outputs."""
     sr, te = _dummy_inputs()
     out    = head(sr, te)
-    assert out.shape[-1] == 5, f"Expected 5 score dims, got {out.shape[-1]}"
+    assert out.shape[-1] == 4, f"Expected 4 score dims, got {out.shape[-1]}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

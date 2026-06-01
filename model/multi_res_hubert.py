@@ -358,6 +358,7 @@ class MultiResHuBERTOutput(NamedTuple):
     logits_hi:   Optional[Tensor]         # (B, T,  V_hi) — pre-training only
     logits_lo:   Optional[Tensor]         # (B, T', V_lo) — pre-training only
     mask_ids:    Tensor                   # (B, T)  bool  — masked positions
+    all_hidden_states: Optional[List[Tensor]] = None  # 24×(B,T,H) when output_hidden_states=True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -522,24 +523,27 @@ class MultiResHuBERT(nn.Module):
         waveforms: Tensor,
         attention_mask: Optional[Tensor] = None,
         apply_mask: bool = True,
+        output_hidden_states: bool = False,
     ) -> MultiResHuBERTOutput:
         """
         Args:
-            waveforms:      (B, T_audio) float32 at 16 kHz.
-            attention_mask: (B, T_audio) int64, 1 = real sample, 0 = pad.
-            apply_mask:     Whether to apply feature masking (pre-training only).
+            waveforms:             (B, T_audio) float32 at 16 kHz.
+            attention_mask:        (B, T_audio) int64, 1 = real sample, 0 = pad.
+            apply_mask:            Whether to apply feature masking (pre-training).
+            output_hidden_states:  If True, collect all per-layer hidden states and
+                                   return them in ``all_hidden_states``.  f₂ outputs
+                                   (at T//stride) are linearly interpolated to T so
+                                   all 24 tensors share shape (B, T_feat, H).
 
         Returns:
             MultiResHuBERTOutput — see field docs above.
         """
         # ── f₀: CNN feature extraction ────────────────────────────────────
-        # HuBERT feature extractor outputs (B, H, T_feat); we need (B, T_feat, H).
         cnn_out = self.feature_extractor(waveforms).transpose(1, 2)  # (B, T_feat, H_cnn)
-        hidden = self.feature_projection(cnn_out)                     # (B, T_feat, H)
+        hidden  = self.feature_projection(cnn_out)                    # (B, T_feat, H)
 
         T_feat = hidden.shape[1]
 
-        # Build feature-level boolean mask (True = valid frame).
         feat_mask_hi: Optional[Tensor] = None
         if attention_mask is not None:
             feat_mask_hi = self._audio_mask_to_feat_mask(attention_mask, T_feat)
@@ -552,32 +556,58 @@ class MultiResHuBERT(nn.Module):
         hidden = self.encoder_ln(hidden)
         hidden = self.encoder_drop(hidden)
 
-        # ── f₁: High-resolution transformer encoder ───────────────────────
         attn_mask_hi = _feat_mask_to_additive(feat_mask_hi)
-        h1 = _run_transformer_layers(self.f1_layers, hidden, attn_mask_hi)
-        # h1: (B, T_feat, H)
 
-        # ── DOWN: reduce temporal resolution ─────────────────────────────
-        h1_down, feat_mask_lo = self.down(h1, feat_mask_hi)
-        # h1_down: (B, T_feat//stride, H)
+        if output_hidden_states:
+            # ── f₁: collect each layer's output ───────────────────────────
+            all_hs: List[Tensor] = []
+            h_cur = hidden
+            for layer in self.f1_layers:
+                h_cur = layer(h_cur, attention_mask=attn_mask_hi)[0]
+                all_hs.append(h_cur)
+            h1 = h_cur
 
-        # ── f₂: Low-resolution transformer encoder ───────────────────────
-        attn_mask_lo = _feat_mask_to_additive(feat_mask_lo)
-        h2 = _run_transformer_layers(self.f2_layers, h1_down, attn_mask_lo)
-        # h2: (B, T_feat//stride, H)
+            # ── DOWN ───────────────────────────────────────────────────────
+            h1_down, feat_mask_lo = self.down(h1, feat_mask_hi)
+            attn_mask_lo = _feat_mask_to_additive(feat_mask_lo)
 
-        # ── UP: restore temporal resolution (+ skip from H₁) ─────────────
-        h2_up = self.up(h2, h1)
-        # h2_up: (B, T_feat, H)
+            # ── f₂: collect + upsample to T_feat ──────────────────────────
+            h_cur = h1_down
+            for layer in self.f2_layers:
+                h_cur = layer(h_cur, attention_mask=attn_mask_lo)[0]
+                # Upsample (B, T//stride, H) → (B, T_feat, H) so all states
+                # have the same temporal length for the weighted sum.
+                upsampled = F.interpolate(
+                    h_cur.transpose(1, 2),
+                    size=T_feat, mode="linear", align_corners=False,
+                ).transpose(1, 2)
+                all_hs.append(upsampled)
+            h2 = h_cur
 
-        # ── f₃: High-resolution transformer encoder ───────────────────────
-        h3 = _run_transformer_layers(self.f3_layers, h2_up, attn_mask_hi)
-        # h3: (B, T_feat, H)
+            # ── UP ─────────────────────────────────────────────────────────
+            h2_up = self.up(h2, h1)
+
+            # ── f₃: collect each layer's output ───────────────────────────
+            h_cur = h2_up
+            for layer in self.f3_layers:
+                h_cur = layer(h_cur, attention_mask=attn_mask_hi)[0]
+                all_hs.append(h_cur)
+            h3 = h_cur
+
+        else:
+            # ── Standard path (unchanged behaviour) ───────────────────────
+            all_hs = None
+            h1      = _run_transformer_layers(self.f1_layers, hidden, attn_mask_hi)
+            h1_down, feat_mask_lo = self.down(h1, feat_mask_hi)
+            attn_mask_lo = _feat_mask_to_additive(feat_mask_lo)
+            h2      = _run_transformer_layers(self.f2_layers, h1_down, attn_mask_lo)
+            h2_up   = self.up(h2, h1)
+            h3      = _run_transformer_layers(self.f3_layers, h2_up, attn_mask_hi)
 
         # ── Output heads ──────────────────────────────────────────────────
         if self.pretrain:
-            logits_hi = self.head_hi(h3)   # (B, T,  V_hi)
-            logits_lo = self.head_lo(h2)   # (B, T', V_lo)
+            logits_hi = self.head_hi(h3)
+            logits_lo = self.head_lo(h2)
             scores    = torch.zeros(waveforms.shape[0], 0, device=waveforms.device)
         else:
             scores    = self.score_head(h3, h2, feat_mask_hi, feat_mask_lo)
@@ -585,12 +615,13 @@ class MultiResHuBERT(nn.Module):
             logits_lo = None
 
         return MultiResHuBERTOutput(
-            scores    = scores,
-            h3        = h3,
-            h2        = h2,
-            logits_hi = logits_hi,
-            logits_lo = logits_lo,
-            mask_ids  = mask_ids,
+            scores            = scores,
+            h3                = h3,
+            h2                = h2,
+            logits_hi         = logits_hi,
+            logits_lo         = logits_lo,
+            mask_ids          = mask_ids,
+            all_hidden_states = all_hs,
         )
 
     # ──────────────────────────────────────────────────────────────────────

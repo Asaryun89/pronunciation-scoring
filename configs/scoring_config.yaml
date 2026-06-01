@@ -1,0 +1,110 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-resolution HuBERT + Qwen3 Cross-Attention Pronunciation Scorer
+#
+# Architecture:
+#   Audio: MultiResHuBERT (pretrained) → weighted sum of 24 layers
+#          → Linear(768, 256) → TransformerEncoder ×1  (Q)
+#   Text:  Faster-Whisper ASR → Qwen3-Embedding-0.6B → mask-aware mean pool
+#          → Linear(1024, 256) + LayerNorm             (K/V)
+#   Fusion: CrossAttention(Q, K, V) → TransformerEncoder ×2
+#          → mean pool → MLPScoringHead → 5 scores × 10
+# ─────────────────────────────────────────────────────────────────────────────
+
+data:
+  hf_dataset_id:      "mispeech/speechocean762"
+  train_split:        "train"
+  test_split:         "test"
+  max_duration_s:     20.0
+  sample_rate:        16000
+  batch_size:         16
+  num_workers:        4
+
+  # ASR — Faster-Whisper (run data/speechocean_asr.py --cache ONCE before training)
+  asr_model:          "base.en"
+  asr_device:         "cuda"
+  asr_compute_type:   "float16"
+  asr_cache_path:     "../data/asr_transcripts.pkl"
+
+  # Audio preprocessing
+  vad_threshold:      0.5            # silero VAD probability threshold
+  target_sr:          16000
+
+model:
+  # ── Multi-res HuBERT backbone ─────────────────────────────────────────────
+  # NOTE: speech_hidden_dim must match the pretrained checkpoint's HuBERT size.
+  #   hubert-base-ls960  → speech_hidden_dim: 768,  layers: 4+4+4  = 12
+  #   hubert-large-ll60k → speech_hidden_dim: 1024, layers: 8+8+8  = 24
+  pretrain_checkpoint:      "../checkpoints/pretrain/best_model.pt"
+  hubert_model_name:        "facebook/hubert-base-ls960"
+  f1_layer_count:           4
+  f2_layer_count:           4
+  f3_layer_count:           4
+  downsample_stride:        2
+  freeze_feature_extractor: true
+  freeze_f1_layers:         false
+  freeze_f2_layers:         false
+  freeze_f3_layers:         false
+  num_hidden_layers:        12           # total transformer layers (f1+f2+f3)
+  speech_hidden_dim:        768          # HuBERT hidden size
+  use_weighted_sum:         true         # learnable weighted sum of all layers
+
+  # ── Projection and pre-fusion transformer ────────────────────────────────
+  proj_dim:             256          # shared dim for audio Q and text K/V
+
+  pre_fusion_layers:    1
+  pre_fusion_heads:     4
+  pre_fusion_dropout:   0.1
+
+  # ── Qwen3 text encoder ────────────────────────────────────────────────────
+  # Requires transformers>=4.51.0; padding_side="left" critical.
+  text_encoder_name:    "Qwen/Qwen3-Embedding-0.6B"
+  text_encoder_dim:     1024
+  freeze_text_encoder:  true         # frozen; unfreeze with care (596M params)
+  text_max_length:      128
+
+  # ── Cross-attention fusion ────────────────────────────────────────────────
+  fusion_heads:         4
+  fusion_dropout:       0.1
+
+  # ── Post-fusion transformer ───────────────────────────────────────────────
+  post_fusion_layers:   2
+  post_fusion_heads:    4
+  post_fusion_dropout:  0.1
+
+  # ── Scoring head ──────────────────────────────────────────────────────────
+  n_scores:             5            # total, accuracy, fluency, prosodic, completeness
+  score_dims:           ["total", "accuracy", "fluency", "prosodic", "completeness"]
+  scoring_dropout:      0.1
+
+training:
+  output_dir:               "../checkpoints/scorer"
+  epochs:                   50
+  lr_speech_encoder:        5.0e-5   # param group A — MultiResHuBERT backbone
+  lr_audio_proj:            1.0e-4   # param group B — proj + layer_weights + pre-fusion
+  lr_text_encoder:          0.0      # param group C — Qwen3 (frozen)
+  lr_fusion:                1.0e-4   # param group D — cross-attn + post-fusion + head
+  min_lr:                   1.0e-6
+  lr_scheduler:             "cosine"
+  warmup_steps:             500
+  optimizer:                "adamw"
+  weight_decay:             1.0e-2
+  betas:                    [0.9, 0.98]
+  grad_clip:                1.0
+  grad_accumulation_steps:  2
+  use_amp:                  true
+  device:                   "cuda"
+  mse_weight:               0.5
+  pcc_weight:               0.5
+  label_smooth_alpha:       0.05
+  save_every_n_epochs:      5
+  keep_last_n_checkpoints:  3
+  best_metric:              "val_pcc_total"
+  early_stopping:           true
+  patience:                 10
+  min_delta:                0.001
+  log_every:                20
+
+logging:
+  use_tb:       true
+  tb_log_dir:   "../logs/scorer"
+  run_name:     "multireshubert-qwen3-crossattn"

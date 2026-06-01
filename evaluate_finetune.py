@@ -86,8 +86,8 @@ def run_inference(
     Run model over entire loader.
 
     Returns:
-        preds:   [N, 5] in [0, 1]
-        targets: [N, 5] in [0, 1]
+        preds:   [N, 4] in [0, 1]
+        targets: [N, 4] in [0, 1]
     """
     model.eval()
     all_pred:   List[np.ndarray] = []

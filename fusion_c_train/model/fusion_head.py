@@ -2,8 +2,8 @@
 Gated fusion scoring head for Fusion-C pronunciation assessment.
 
 Combines mean-pooled speech representations (from f₃) with L2-normalised
-BGE text embeddings via a learned element-wise gate, then passes the fused
-representation through 5 independent per-dimension MLP regressors.
+Qwen3 text embeddings via a learned element-wise gate, then passes the fused
+representation through 4 independent per-dimension MLP regressors.
 
 Score dimension order (output indices):
     0 → total
@@ -88,14 +88,14 @@ class FusionScoringHead(nn.Module):
          gate  = sigmoid( Linear(in_dim, in_dim)(concat) )
          fused = gate ⊙ concat                              [B, in_dim]
 
-    3. Five independent PerDimRegressors, one per score dimension.
+    3. Four independent PerDimRegressors, one per score dimension.
        Each regressor receives the same fused tensor and produces [B].
 
-    4. Stack outputs in SCORE_DIMS order → [B, 5]
+    4. Stack outputs in SCORE_DIMS order → [B, 4]
 
     Args:
         speech_dim: Dimensionality of the speech representation (e.g. 1024).
-        text_dim:   Dimensionality of the text embedding (e.g. 384).
+        text_dim:   Dimensionality of the text embedding (e.g. 1024).
         hidden:     Internal MLP width (e.g. 512).
         n_scores:   Number of output score dimensions (must equal len(SCORE_DIMS) = 4).
         dropout:    Dropout probability in the MLP.
@@ -137,7 +137,7 @@ class FusionScoringHead(nn.Module):
         """
         Args:
             speech_rep: [B, speech_dim] — mean-pooled f₃ output
-            text_emb:   [B, text_dim]   — BGE [CLS] embedding (L2-normalised)
+            text_emb:   [B, text_dim]   — Qwen3 last-token embedding (L2-normalised)
 
         Returns:
             scores: [B, 4] in (0, 1)
@@ -149,4 +149,4 @@ class FusionScoringHead(nn.Module):
 
         return torch.stack(
             [self.regressors[name](fused) for name in SCORE_DIMS], dim=-1
-        )  # [B, 5]
+        )  # [B, 4]

@@ -7,7 +7,7 @@ from .multi_res_hubert import (
     UnitPredictionHead,
     PronunciationScoreHead,
 )
-from .text_encoder import BGETextEncoder
+from .text_encoder import Qwen3TextEncoder
 from .fusion_head import FusionScoringHead
 from .multireshubert_finetune import MultiResHuBERTFinetune
 
@@ -19,7 +19,7 @@ __all__ = [
     "ConvFeatureMasking",
     "UnitPredictionHead",
     "PronunciationScoreHead",
-    "BGETextEncoder",
+    "Qwen3TextEncoder",
     "FusionScoringHead",
     "MultiResHuBERTFinetune",
 ]
