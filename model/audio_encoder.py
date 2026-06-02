@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from .multi_res_hubert import MultiResHuBERT
+from .flat_hubert import FlatHuBERT
 
 log = logging.getLogger(__name__)
 
@@ -42,23 +43,32 @@ class AudioEncoder(nn.Module):
         h_dim    = mcfg["speech_hidden_dim"]   # HuBERT hidden size (768 or 1024)
         proj_dim = mcfg["proj_dim"]            # shared projection dim
 
+        # ── FlatHuBERT backbone ──
+        self.backbone = FlatHuBERT(
+            hubert_model_name       = mcfg["hubert_model_name"],
+            freeze_feature_extractor= mcfg.get("freeze_feature_extractor", True),
+            mask_prob               = 0.0,
+            mask_length             = 0,
+            num_units               = mcfg.get("num_units_hi", 100),
+            pretrain                = True,
+        )
         # ── MultiResHuBERT backbone ────────────────────────────────────────
         # pretrain=True so the key layout matches the pre-training checkpoint
         # (head_hi + head_lo instead of score_head).
-        self.backbone = MultiResHuBERT(
-            hubert_model_name       = mcfg["hubert_model_name"],
-            f1_layer_count          = mcfg["f1_layer_count"],
-            f2_layer_count          = mcfg["f2_layer_count"],
-            f3_layer_count          = mcfg["f3_layer_count"],
-            downsample_stride       = mcfg.get("downsample_stride", 2),
-            freeze_feature_extractor= mcfg.get("freeze_feature_extractor", True),
-            freeze_f1_layers        = False,   # freeze handled below after load
-            mask_prob               = 0.0,
-            mask_length             = 0,
-            num_units_hi            = mcfg.get("num_units_hi", 100),
-            num_units_lo            = mcfg.get("num_units_lo", 100),
-            pretrain                = True,
-        )
+        # self.backbone = MultiResHuBERT(
+        #     hubert_model_name       = mcfg["hubert_model_name"],
+        #     f1_layer_count          = mcfg["f1_layer_count"],
+        #     f2_layer_count          = mcfg["f2_layer_count"],
+        #     f3_layer_count          = mcfg["f3_layer_count"],
+        #     downsample_stride       = mcfg.get("downsample_stride", 2),
+        #     freeze_feature_extractor= mcfg.get("freeze_feature_extractor", True),
+        #     freeze_f1_layers        = False,   # freeze handled below after load
+        #     mask_prob               = 0.0,
+        #     mask_length             = 0,
+        #     num_units_hi            = mcfg.get("num_units_hi", 100),
+        #     num_units_lo            = mcfg.get("num_units_lo", 100),
+        #     pretrain                = True,
+        # )
 
         # ── Load pre-training checkpoint ───────────────────────────────────
         ckpt_path = mcfg.get("pretrain_checkpoint")
@@ -70,12 +80,49 @@ class AudioEncoder(nn.Module):
                 )
             log.info("Loading pre-train checkpoint: %s", ckpt_path)
             ckpt  = torch.load(ckpt_path, map_location="cpu")
-            state = ckpt.get("model_state", ckpt)   # handle both save formats
-            missing, unexpected = self.backbone.load_state_dict(state, strict=True)
-            log.info(
-                "Backbone loaded (missing=%d, unexpected=%d)",
-                len(missing), len(unexpected),
-            )
+            state = ckpt.get("model_state", ckpt)
+
+            # Strip wrapper prefixes that old training pipelines may have added.
+            for prefix in ("speech_model.", "backbone.", "model."):
+                if any(k.startswith(prefix) for k in state):
+                    log.info("Stripping '%s' prefix from checkpoint keys.", prefix)
+                    state = {k[len(prefix):]: v
+                             for k, v in state.items()
+                             if k.startswith(prefix)}
+                    break
+
+            # Load with strict=False so pretrain-only heads (head_hi/head_lo)
+            # and any minor key-count mismatches don't crash initialisation.
+            missing, unexpected = self.backbone.load_state_dict(state, strict=False)
+
+            # Identify which core backbone components actually loaded.
+            loaded = set(state.keys()) - set(unexpected)
+            core   = ["feature_extractor", "f1_layers", "f2_layers",
+                      "down", "up", "f3_layers"]
+            for comp in core:
+                if not any(k.startswith(comp) for k in loaded):
+                    log.warning(
+                        "Core component '%s' NOT found in checkpoint — "
+                        "weights will be random for this block.", comp
+                    )
+
+            if unexpected:
+                log.info(
+                    "%d checkpoint keys not used by this model (e.g. pretrain heads): "
+                    "%s%s",
+                    len(unexpected),
+                    ", ".join(unexpected[:3]),
+                    " ..." if len(unexpected) > 3 else "",
+                )
+            if missing:
+                log.warning(
+                    "%d model keys not found in checkpoint: %s%s",
+                    len(missing),
+                    ", ".join(missing[:3]),
+                    " ..." if len(missing) > 3 else "",
+                )
+
+            log.info("Backbone loaded (missing=%d, unexpected=%d)", len(missing), len(unexpected))
         else:
             log.warning("No pretrain_checkpoint — backbone uses random HuBERT weights.")
 

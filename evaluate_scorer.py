@@ -17,7 +17,6 @@ Results table (scores in [0, 10]):
     accuracy     |        |        |
     fluency      |        |        |
     prosodic     |        |        |
-    completeness |        |        |
     MEAN         |        |        |
 
 Ablation (text path zeroed):
@@ -269,7 +268,7 @@ def main() -> None:
     log.info("Running full Fusion-C inference …")
     full_preds, targets = run_inference(model, loader, device, speech_only=False)
     full_metrics = compute_metrics(full_preds, targets)
-    _print_results("RESULTS (completeness included)", full_metrics)
+    _print_results("RESULTS", full_metrics)
 
     # Speech-only ablation
     log.info("Running speech-only ablation (text_emb = 0) …")

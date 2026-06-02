@@ -50,9 +50,10 @@ class PronunciationScorer(nn.Module):
 
         # ── Text path ───────────────────────────────────────────────────────
         self.text_encoder = Qwen3MeanPoolEncoder(
-            model_name = mcfg["text_encoder_name"],
-            max_length  = mcfg.get("text_max_length", 128),
-            frozen      = mcfg.get("freeze_text_encoder", True),
+            model_name    = mcfg["text_encoder_name"],
+            max_length    = mcfg.get("text_max_length", 128),
+            frozen        = mcfg.get("freeze_text_encoder", True),
+            padding_side  = mcfg.get("text_padding_side", "left"),
         )
         self._text_dim = mcfg["text_encoder_dim"]
 

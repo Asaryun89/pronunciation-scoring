@@ -47,14 +47,34 @@ _TARGET_SR         = 16_000
 # Feature iterators (HuggingFace dataset → utt_id, feature array)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _utt_id_from_row(row: dict, idx: int) -> str:
-    """Derive a stable utterance ID from the audio path in an HF row."""
-    path = (row["audio"].get("path") or "") if isinstance(row["audio"], dict) else ""
-    return Path(path).stem if path else f"utt_{idx:06d}"
+def _precompute_utt_ids(hf_ds) -> List[str]:
+    """
+    Extract stable utterance IDs by loading audio metadata with decode=False.
+
+    This mirrors PretrainDataset exactly: Audio(decode=False) always returns a
+    plain dict {"path": ..., "bytes": ...}, so path is reliably available even
+    when the dataset comes from the HuggingFace Hub (where decoded rows have a
+    None path after streaming).
+    """
+    try:
+        from datasets import Audio
+    except ImportError:
+        return [f"utt_{i:06d}" for i in range(len(hf_ds))]
+
+    path_ds  = hf_ds.cast_column("audio", Audio(sampling_rate=_TARGET_SR, decode=False))
+    audio_meta = path_ds["audio"]
+    ids = []
+    for i, a in enumerate(audio_meta):
+        path = (a.get("path") or "") if isinstance(a, dict) \
+               else (getattr(a, "path", "") or "")
+        stem = Path(path).stem
+        ids.append(stem if stem else f"utt_{i:06d}")
+    return ids
 
 
 def _mfcc_iterator(
     hf_ds,
+    utt_ids:    List[str],
     n_mfcc:     int,
     max_frames: Optional[int],
 ) -> Iterator[Tuple[str, np.ndarray]]:
@@ -74,7 +94,7 @@ def _mfcc_iterator(
         ),
     )
     for i, row in enumerate(hf_ds):
-        utt_id = _utt_id_from_row(row, i)
+        utt_id = utt_ids[i]
         try:
             arr = np.asarray(row["audio"]["array"], dtype=np.float32)
             wav = torch.from_numpy(arr)
@@ -92,6 +112,7 @@ def _mfcc_iterator(
 def _model_feature_iterator(
     model:      torch.nn.Module,
     hf_ds,
+    utt_ids:    List[str],
     device:     torch.device,
     max_frames: Optional[int],
 ) -> Iterator[Tuple[str, np.ndarray]]:
@@ -100,7 +121,7 @@ def _model_feature_iterator(
     """
     model.eval()
     for i, row in enumerate(hf_ds):
-        utt_id = _utt_id_from_row(row, i)
+        utt_id = utt_ids[i]
         try:
             arr = np.asarray(row["audio"]["array"], dtype=np.float32)
             wav = torch.from_numpy(arr)
@@ -236,8 +257,11 @@ class KMeansQuantizer:
         Args:
             hf_ds: HuggingFace dataset with ``audio`` column cast to 16 kHz.
         """
+        log.info("Pre-computing utterance IDs (decode=False) …")
+        utt_ids = _precompute_utt_ids(hf_ds)
+        log.info("  %d utterances  (first 3: %s)", len(utt_ids), utt_ids[:3])
         self._fit_incremental(
-            _mfcc_iterator(hf_ds, n_mfcc, max_frames_per_utt),
+            _mfcc_iterator(hf_ds, utt_ids, n_mfcc, max_frames_per_utt),
             accumulate_frames,
         )
 
@@ -256,10 +280,13 @@ class KMeansQuantizer:
             model: MultiResHuBERT in eval mode.
             hf_ds: HuggingFace dataset with ``audio`` column cast to 16 kHz.
         """
+        log.info("Pre-computing utterance IDs (decode=False) …")
+        utt_ids = _precompute_utt_ids(hf_ds)
+        log.info("  %d utterances  (first 3: %s)", len(utt_ids), utt_ids[:3])
         dev = torch.device(device)
         model = model.to(dev)
         self._fit_incremental(
-            _model_feature_iterator(model, hf_ds, dev, max_frames_per_utt),
+            _model_feature_iterator(model, hf_ds, utt_ids, dev, max_frames_per_utt),
             accumulate_frames,
         )
 

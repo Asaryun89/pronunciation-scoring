@@ -50,6 +50,7 @@ class Qwen3MeanPoolEncoder(nn.Module):
         model_name: str = "Qwen/Qwen3-Embedding-0.6B",
         max_length: int = 128,
         frozen: bool = True,
+        padding_side: str = "left",
     ) -> None:
         super().__init__()
         try:
@@ -62,7 +63,7 @@ class Qwen3MeanPoolEncoder(nn.Module):
 
         self.max_length = max_length
         self.tokenizer  = AutoTokenizer.from_pretrained(
-            model_name, padding_side="left"
+            model_name, padding_side=padding_side
         )
         self.model  = AutoModel.from_pretrained(
             model_name, torch_dtype=torch.float16

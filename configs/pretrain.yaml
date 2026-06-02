@@ -29,11 +29,11 @@ kmeans:
   cnn_stride:         320        # HuBERT base CNN total stride (samples per frame)
 
 model:
-  hubert_model_name:        "facebook/hubert-large-ll60k"
-  # Transformer layer split: f1 + f2 + f3 must equal num_hidden_layers (24)
-  f1_layer_count:           8
-  f2_layer_count:           8
-  f3_layer_count:           8
+  hubert_model_name:        "facebook/hubert-base-ls960"
+  # Transformer layer split: f1 + f2 + f3 must equal num_hidden_layers (12)
+  f1_layer_count:           4
+  f2_layer_count:           4
+  f3_layer_count:           4
   downsample_stride:        2
   # During pre-training, train everything
   freeze_feature_extractor: false

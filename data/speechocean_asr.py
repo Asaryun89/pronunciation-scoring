@@ -26,7 +26,8 @@ Audio preprocessing per sample
 
 Score order in labels tensor
 ─────────────────────────────
-    [total, accuracy, fluency, prosodic, completeness]  — normalised to [0, 1]
+    [total, accuracy, fluency, prosodic]  — normalised to [0, 1]
+    (completeness excluded — skewed distribution)
 """
 
 from __future__ import annotations
@@ -45,13 +46,13 @@ from torch.utils.data import Dataset
 
 log = logging.getLogger(__name__)
 
-SCORE_KEYS: List[str] = ["total", "accuracy", "fluency", "prosodic", "completeness"]
+SCORE_KEYS: List[str] = ["total", "accuracy", "fluency", "prosodic"]
+# "completeness" excluded — skewed distribution causes persistent low PCC
 SCORE_MAX:  float     = 10.0
 TARGET_SR:  int       = 16_000
 
 # HF dataset field name candidates for the "total" score column.
 _TOTAL_CANDIDATES: List[str] = ["score", "total", "total_score"]
-_COMPLETENESS_CANDIDATES: List[str] = ["completeness"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,21 +289,20 @@ class SpeechOceanASRDataset(Dataset):
         self._ds = hf_ds
 
         # Resolve score field names.
-        cols            = hf_ds.column_names
-        total_col       = _resolve_col(cols, _TOTAL_CANDIDATES, "total")
-        complete_col    = _resolve_col(cols, _COMPLETENESS_CANDIDATES, "completeness")
+        cols      = hf_ds.column_names
+        total_col = _resolve_col(cols, _TOTAL_CANDIDATES, "total")
 
-        # Build (N, 5) label tensor: [total, acc, flu, pro, comp] in [0, 1]
+        # Build (N, 4) label tensor: [total, acc, flu, pro] in [0, 1]
         label_cols = [
-            np.array(hf_ds[total_col],       dtype=np.float32) / SCORE_MAX,
-            np.array(hf_ds["accuracy"],       dtype=np.float32) / SCORE_MAX,
-            np.array(hf_ds["fluency"],        dtype=np.float32) / SCORE_MAX,
-            np.array(hf_ds["prosodic"],       dtype=np.float32) / SCORE_MAX,
-            np.array(hf_ds[complete_col],     dtype=np.float32) / SCORE_MAX,
+            np.array(hf_ds[total_col],   dtype=np.float32) / SCORE_MAX,
+            np.array(hf_ds["accuracy"],  dtype=np.float32) / SCORE_MAX,
+            np.array(hf_ds["fluency"],   dtype=np.float32) / SCORE_MAX,
+            np.array(hf_ds["prosodic"],  dtype=np.float32) / SCORE_MAX,
+            # completeness excluded — see SCORE_KEYS comment above
         ]
         self.labels: Tensor = torch.from_numpy(
             np.column_stack(label_cols)
-        )                              # (N, 5)
+        )                              # (N, 4)
 
         # Load ASR cache.
         cache_path = Path(dcfg["asr_cache_path"])
@@ -416,7 +416,17 @@ def _main() -> None:
     args = parser.parse_args()
 
     import yaml
-    cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
+    cfg_file = Path(args.config).resolve()
+    cfg_dir  = cfg_file.parent
+    cfg = yaml.safe_load(cfg_file.read_text(encoding="utf-8"))
+
+    # Resolve relative paths anchored to the config file directory —
+    # same logic as train_scorer.py load_cfg so the cache lands in the
+    # same place both scripts expect it.
+    raw = (cfg.get("data") or {}).get("asr_cache_path")
+    if raw and not Path(raw).is_absolute():
+        cfg["data"]["asr_cache_path"] = str(cfg_dir / raw)
+
     cache_asr_transcripts(cfg)
 
 

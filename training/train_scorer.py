@@ -51,7 +51,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-_DIM_NAMES: List[str] = SCORE_KEYS   # ["total", "accuracy", "fluency", "prosodic", "completeness"]
+_DIM_NAMES: List[str] = SCORE_KEYS   # ["total", "accuracy", "fluency", "prosodic"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

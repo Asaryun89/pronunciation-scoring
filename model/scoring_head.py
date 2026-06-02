@@ -9,7 +9,7 @@ Score dimension order (matches dataset label order):
     1 → accuracy
     2 → fluency
     3 → prosodic
-    4 → completeness
+    (completeness excluded — skewed distribution, persistent low PCC)
 """
 
 from __future__ import annotations
@@ -20,7 +20,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-SCORE_DIMS: List[str] = ["total", "accuracy", "fluency", "prosodic", "completeness"]
+SCORE_DIMS: List[str] = ["total", "accuracy", "fluency", "prosodic"]
+# "completeness" excluded — skewed distribution causes persistent low PCC
 
 
 class _DimHead(nn.Module):

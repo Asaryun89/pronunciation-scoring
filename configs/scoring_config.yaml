@@ -2,7 +2,7 @@
 # Multi-resolution HuBERT + Qwen3 Cross-Attention Pronunciation Scorer
 #
 # Architecture:
-#   Audio: MultiResHuBERT (pretrained) → weighted sum of 24 layers
+#   Audio: FlatHuBERT (pretrained) → weighted sum of 12 layers
 #          → Linear(768, 256) → TransformerEncoder ×1  (Q)
 #   Text:  Faster-Whisper ASR → Qwen3-Embedding-0.6B → mask-aware mean pool
 #          → Linear(1024, 256) + LayerNorm             (K/V)
@@ -16,7 +16,7 @@ data:
   test_split:         "test"
   max_duration_s:     20.0
   sample_rate:        16000
-  batch_size:         16
+  batch_size:         4
   num_workers:        4
 
   # ASR — Faster-Whisper (run data/speechocean_asr.py --cache ONCE before training)
@@ -45,7 +45,7 @@ model:
   freeze_f2_layers:         false
   freeze_f3_layers:         false
   num_hidden_layers:        12           # total transformer layers (f1+f2+f3)
-  speech_hidden_dim:        768          # HuBERT hidden size
+  speech_hidden_dim:        768          # hubert-base hidden size
   use_weighted_sum:         true         # learnable weighted sum of all layers
 
   # ── Projection and pre-fusion transformer ────────────────────────────────
@@ -61,6 +61,7 @@ model:
   text_encoder_dim:     1024
   freeze_text_encoder:  true         # frozen; unfreeze with care (596M params)
   text_max_length:      128
+  text_padding_side:    "left"       # MUST be "left" for decoder-only last-token pooling
 
   # ── Cross-attention fusion ────────────────────────────────────────────────
   fusion_heads:         4
@@ -72,8 +73,8 @@ model:
   post_fusion_dropout:  0.1
 
   # ── Scoring head ──────────────────────────────────────────────────────────
-  n_scores:             5            # total, accuracy, fluency, prosodic, completeness
-  score_dims:           ["total", "accuracy", "fluency", "prosodic", "completeness"]
+  n_scores:             4            # completeness excluded — skewed distribution
+  score_dims:           ["total", "accuracy", "fluency", "prosodic"]
   scoring_dropout:      0.1
 
 training:

@@ -1,21 +1,16 @@
 """
-Loss functions for Multi-resolution HuBERT.
+Loss functions for Multi-resolution HuBERT pre-training.
 
-Two modes mirror the two operating modes of MultiResHuBERT:
+MultiResPretrainingLoss: combined cross-entropy over masked positions for
+both the high-resolution (g^q_R1, from H₃) and low-resolution (g^q_R2,
+from H₂) unit-prediction heads, following the combined quantization scheme
+g^q_{R1,R2}.
 
-1. Pre-training  — MultiResPretrainingLoss
-   Combines cross-entropy over masked positions for BOTH the high-resolution
-   (g^q_R1, from H₃) and low-resolution (g^q_R2, from H₂) unit-prediction
-   heads, following the combined quantization scheme g^q_{R1,R2}.
-
-2. Fine-tuning   — PronunciationLoss
-   Weighted MSE + Pearson-correlation loss over the five MOS score dimensions
-   (accuracy, fluency, completeness, prosodic, total).
+Fine-tuning losses (smoothed MSE + PCC) are defined inline in
+training/train_scorer.py.
 """
 
 from __future__ import annotations
-
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -45,7 +40,7 @@ class MultiResPretrainingLoss(nn.Module):
 
     def __init__(
         self,
-        hi_weight: float = 1.0,
+        hi_weight: float = 1.5,
         lo_weight: float = 1.0,
         downsample_stride: int = 2,
     ) -> None:
@@ -136,65 +131,3 @@ class MultiResPretrainingLoss(nn.Module):
         loss_lo = self.masked_ce(logits_lo, targets_lo, mask_lo)
 
         return self.hi_weight * loss_hi + self.lo_weight * loss_lo
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Fine-tuning loss  (pronunciation score regression)
-# ─────────────────────────────────────────────────────────────────────────────
-
-class PronunciationLoss(nn.Module):
-    """
-    Weighted MSE + (1 − Pearson r) loss for multi-dimensional MOS regression.
-
-    The Pearson term pushes the model to rank utterances correctly even when
-    the absolute scale drifts; the MSE term anchors absolute values.
-
-    Args:
-        score_weights: Per-dimension loss weights
-                       [accuracy, fluency, completeness, prosodic, total].
-                       The ``total`` dimension is up-weighted by default.
-        mse_weight:    Global coefficient for the MSE term.
-        corr_weight:   Global coefficient for the (1 − Pearson r) term.
-    """
-
-    def __init__(
-        self,
-        score_weights: Optional[list[float]] = None,
-        mse_weight: float  = 1.0,
-        corr_weight: float = 0.5,
-    ) -> None:
-        super().__init__()
-        if score_weights is None:
-            # [accuracy, fluency, completeness, prosodic, total]
-            score_weights = [1.0, 1.0, 1.0, 1.0, 2.0]
-        self.register_buffer(
-            "score_weights",
-            torch.tensor(score_weights, dtype=torch.float32),
-        )
-        self.mse_weight  = mse_weight
-        self.corr_weight = corr_weight
-
-    @staticmethod
-    def _pearson_loss(pred: Tensor, target: Tensor) -> Tensor:
-        """1 − Pearson r, averaged over score dimensions."""
-        vp   = pred   - pred.mean(dim=0, keepdim=True)
-        vt   = target - target.mean(dim=0, keepdim=True)
-        corr = (vp * vt).sum(0) / (vp.norm(dim=0) * vt.norm(dim=0) + 1e-8)
-        return (1.0 - corr).mean()
-
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        """
-        Args:
-            pred:   (B, n_scores) in [0, 1] — model output
-            target: (B, n_scores) in [0, 1] — normalised ground truth
-
-        Returns:
-            Scalar loss.
-        """
-        w = self.score_weights / self.score_weights.sum()
-
-        mse_per_dim = F.mse_loss(pred, target, reduction="none").mean(0)  # (n_scores,)
-        mse  = (mse_per_dim * w).sum()
-        corr = self._pearson_loss(pred, target)
-
-        return self.mse_weight * mse + self.corr_weight * corr
