@@ -172,6 +172,9 @@ class PronunciationScorer(nn.Module):
         pooled_flu = _masked_mean(pre_fused[1])
         pooled_pro = _masked_mean(pre_fused[2])
 
+        # TODO Upgrade 3 aux: add phoneme head when frame labels available
+        # phoneme_logits = None; phoneme_labels = None
+
         # ── Per-dimension scoring ────────────────────────────────────────────
         score_tot = self.scoring_head.total_mlp(pooled_tot)
         score_acc = self.scoring_head.accuracy_mlp(pooled_acc)
