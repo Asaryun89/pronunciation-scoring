@@ -407,6 +407,54 @@ class ScorerTrainer:
                     old.unlink()
 
     # ──────────────────────────────────────────────────────────────────────
+    # Epoch table helpers
+    # ──────────────────────────────────────────────────────────────────────
+
+    # Column widths (chars): epoch, loss, pcc×4, mse, lr, time
+    _COL_W = (8, 8, 7, 7, 7, 7, 8, 10, 10)
+    _HEADERS = ("Epoch", "Loss", "PCC_tot", "PCC_acc", "PCC_flu", "PCC_pro",
+                "MSE", "LR", "Time")
+
+    def _print_epoch_header(self) -> None:
+        widths  = self._COL_W
+        headers = self._HEADERS
+        header  = "  ".join(f"{h:>{w}}" for h, w in zip(headers, widths))
+        sep     = "  ".join("─" * w for w in widths)
+        log.info(header)
+        log.info(sep)
+
+    def _print_epoch_row(
+        self,
+        epoch:       int,
+        epochs:      int,
+        train_loss:  float,
+        val_metrics: Dict[str, float],
+        lr:          float,
+    ) -> None:
+        widths = self._COL_W
+        pcc    = [val_metrics.get(f"val_pcc_{k}", float("nan")) for k in _DIM_NAMES]
+        mse    = val_metrics.get("val_mse_total", float("nan"))
+        best   = self.patience_count == 0   # just improved
+
+        def _f(v: float, w: int, prec: int = 4) -> str:
+            s = f"{v:.{prec}f}" if not math.isnan(v) else "  nan"
+            return f"{s:>{w}}"
+
+        row = "  ".join([
+            f"{epoch:>{widths[0]-len(str(epochs))-1}d}/{epochs}",
+            _f(train_loss,  widths[1]),
+            _f(pcc[0],      widths[2]),
+            _f(pcc[1],      widths[3]),
+            _f(pcc[2],      widths[4]),
+            _f(pcc[3],      widths[5]),
+            _f(mse,         widths[6]),
+            f"{lr:>{widths[7]}.2e}",
+            f"{self._elapsed_str():>{widths[8]}}",
+        ])
+        marker = " *" if best else ""
+        log.info("%s%s", row, marker)
+
+    # ──────────────────────────────────────────────────────────────────────
     # Main loop
     # ──────────────────────────────────────────────────────────────────────
 
@@ -423,25 +471,17 @@ class ScorerTrainer:
             self.device, epochs,
             tcfg["lr_speech_encoder"], tcfg["lr_audio_proj"], tcfg["lr_fusion"],
         )
+        self._print_epoch_header()
 
         for epoch in range(self.start_epoch + 1, epochs + 1):
-            log.info("── Epoch %d / %d ──", epoch, epochs)
             train_loss  = self._train_epoch(epoch)
             val_metrics = self._validate()
 
-            pcc_total = val_metrics.get("val_pcc_total", float("nan"))
             mse_total = val_metrics.get("val_mse_total", float("nan"))
             lr        = self._current_lr()
 
-            log.info(
-                "Epoch %d/%d — train=%.4f  val_pcc_total=%.4f  val_mse=%.4f  lr=%.2e | %s",
-                epoch, epochs, train_loss, pcc_total, mse_total, lr, self._elapsed_str(),
-            )
-            dim_line = "  ".join(
-                f"{k[:3]}={val_metrics.get(f'val_pcc_{k}', float('nan')):.3f}"
-                for k in _DIM_NAMES
-            )
-            log.info("  PCC → %s", dim_line)
+            self._manage_checkpoints(epoch, val_metrics)
+            self._print_epoch_row(epoch, epochs, train_loss, val_metrics, lr)
 
             self._val_csv.write({
                 "epoch":        epoch,
@@ -474,8 +514,64 @@ class ScorerTrainer:
     # ──────────────────────────────────────────────────────────────────────
 
     def load_checkpoint(self, path: str) -> None:
-        ckpt = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(ckpt["model_state"])
+        from model.audio_encoder import (
+            initialize_layer_weights_from_pretrained,
+            migrate_audio_proj,
+        )
+
+        ckpt         = torch.load(path, map_location=self.device, weights_only=False)
+        model_state  = ckpt["model_state"]
+
+        # Stash old architecture tensors before load so we can migrate them
+        # if the checkpoint predates the dim-conditioned layer_weights upgrade.
+        old_lw     = model_state.get("audio_encoder.layer_weights")
+        old_proj_w = model_state.get("audio_encoder.proj.weight")
+        old_proj_b = model_state.get("audio_encoder.proj.bias")
+
+        missing, unexpected = self.model.load_state_dict(model_state, strict=False)
+        if missing or unexpected:
+            log.warning(
+                "load_state_dict (strict=False): %d missing, %d unexpected keys.",
+                len(missing), len(unexpected),
+            )
+            if missing:
+                log.warning(
+                    "  Missing keys: %s%s",
+                    ", ".join(missing[:5]),
+                    " ..." if len(missing) > 5 else "",
+                )
+            if unexpected:
+                log.warning(
+                    "  Unexpected keys: %s%s",
+                    ", ".join(unexpected[:5]),
+                    " ..." if len(unexpected) > 5 else "",
+                )
+
+        # If the checkpoint has 1-D layer_weights (pre-upgrade shape [N]),
+        # re-initialize the new [4, N] parameter using the old weights for
+        # row 3 (total) and Gaussian peaks for rows 0-2.
+        ae = self.model.audio_encoder
+        N  = ae.layer_weights.shape[1]
+        if old_lw is not None and old_lw.dim() == 1:
+            log.info(
+                "Old layer_weights shape %s detected → "
+                "re-initializing as [4, %d] with Gaussian peaks.",
+                list(old_lw.shape), N,
+            )
+            initialize_layer_weights_from_pretrained(ae, old_lw.to(self.device), N)
+
+        # If the checkpoint has a flat (single) audio_proj, warm-start all
+        # 4 new projection heads from those weights.
+        if old_proj_w is not None and not isinstance(
+            dict(self.model.named_modules()).get("audio_encoder.proj"), torch.nn.ModuleList
+        ):
+            log.info("Migrating old audio_proj weights to all 4 projection heads.")
+            migrate_audio_proj(
+                ae,
+                old_proj_w.to(self.device),
+                old_proj_b.to(self.device),
+            )
+
         try:
             self.optimizer.load_state_dict(ckpt["optimizer_state"])
         except (ValueError, RuntimeError) as exc:

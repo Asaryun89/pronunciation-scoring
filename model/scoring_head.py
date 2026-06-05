@@ -1,10 +1,11 @@
 """
 MLP scoring head for pronunciation assessment.
 
-5 independent per-dimension regressors, each with sigmoid output in (0, 1).
-Multiply by 10 to get MOS scores in (0, 10).
+4 independent per-dimension regressors, each with sigmoid output in (0, 1).
+Scores are in [0, 1] to match the normalised labels in SpeechOceanASRDataset
+(raw scores divided by SCORE_MAX=10 before training).
 
-Score dimension order (matches dataset label order):
+Score dimension order (matches SCORE_DIMS / dataset label order):
     0 → total
     1 → accuracy
     2 → fluency
@@ -45,9 +46,10 @@ class _DimHead(nn.Module):
 
 class MLPScoringHead(nn.Module):
     """
-    5 independent MLP regressors producing scores in [0, 1].
+    4 independent MLP regressors producing scores in [0, 1].
 
-    Multiply the output by 10 to obtain MOS-range scores in [0, 10].
+    Each dimension receives its own pooled feature vector from
+    PronunciationScorer (dimension-conditioned audio features).
 
     Args:
         cfg: Full config dict (reads model.proj_dim and model.scoring_dropout).
@@ -60,9 +62,11 @@ class MLPScoringHead(nn.Module):
         mcfg    = cfg["model"]
         in_dim  = mcfg["proj_dim"]
         dropout = mcfg.get("scoring_dropout", 0.1)
-        self.heads = nn.ModuleList(
-            [_DimHead(in_dim, dropout) for _ in SCORE_DIMS]
-        )
+        # Named per-dimension heads — order matches SCORE_DIMS
+        self.total_mlp    = _DimHead(in_dim, dropout)
+        self.accuracy_mlp = _DimHead(in_dim, dropout)
+        self.fluency_mlp  = _DimHead(in_dim, dropout)
+        self.prosodic_mlp = _DimHead(in_dim, dropout)
 
     @property
     def n_scores(self) -> int:
@@ -70,11 +74,20 @@ class MLPScoringHead(nn.Module):
 
     def forward(self, pooled: Tensor) -> Tensor:
         """
+        Shared-input forward for backward-compatibility (e.g. evaluation scripts
+        that pass a single pooled vector).  PronunciationScorer.forward calls
+        the sub-heads directly with per-dimension pooled vectors.
+
         Args:
             pooled: [B, proj_dim] — mean-pooled post-fusion features
 
         Returns:
-            [B, 5] — per-dimension scores in (0, 1);
-                     multiply by 10 for MOS display.
+            [B, 4] — per-dimension scores in (0, 1);
+                     order: [total, accuracy, fluency, prosodic]
         """
-        return torch.cat([h(pooled) for h in self.heads], dim=-1)
+        return torch.cat([
+            self.total_mlp(pooled),
+            self.accuracy_mlp(pooled),
+            self.fluency_mlp(pooled),
+            self.prosodic_mlp(pooled),
+        ], dim=-1)

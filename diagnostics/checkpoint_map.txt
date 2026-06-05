@@ -1,0 +1,1453 @@
+{
+  "feature_extractor.conv_layers.0.conv.weight": {
+    "shape": [
+      512,
+      1,
+      10
+    ],
+    "dtype": "torch.float32"
+  },
+  "feature_extractor.conv_layers.0.layer_norm.weight": {
+    "shape": [
+      512
+    ],
+    "dtype": "torch.float32"
+  },
+  "feature_extractor.conv_layers.0.layer_norm.bias": {
+    "shape": [
+      512
+    ],
+    "dtype": "torch.float32"
+  },
+  "feature_extractor.conv_layers.1.conv.weight": {
+    "shape": [
+      512,
+      512,
+      3
+    ],
+    "dtype": "torch.float32"
+  },
+  "feature_extractor.conv_layers.2.conv.weight": {
+    "shape": [
+      512,
+      512,
+      3
+    ],
+    "dtype": "torch.float32"
+  },
+  "feature_extractor.conv_layers.3.conv.weight": {
+    "shape": [
+      512,
+      512,
+      3
+    ],
+    "dtype": "torch.float32"
+  },
+  "feature_extractor.conv_layers.4.conv.weight": {
+    "shape": [
+      512,
+      512,
+      3
+    ],
+    "dtype": "torch.float32"
+  },
+  "feature_extractor.conv_layers.5.conv.weight": {
+    "shape": [
+      512,
+      512,
+      2
+    ],
+    "dtype": "torch.float32"
+  },
+  "feature_extractor.conv_layers.6.conv.weight": {
+    "shape": [
+      512,
+      512,
+      2
+    ],
+    "dtype": "torch.float32"
+  },
+  "feature_projection.layer_norm.weight": {
+    "shape": [
+      512
+    ],
+    "dtype": "torch.float32"
+  },
+  "feature_projection.layer_norm.bias": {
+    "shape": [
+      512
+    ],
+    "dtype": "torch.float32"
+  },
+  "feature_projection.projection.weight": {
+    "shape": [
+      768,
+      512
+    ],
+    "dtype": "torch.float32"
+  },
+  "feature_projection.projection.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "pos_conv_embed.conv.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "pos_conv_embed.conv.parametrizations.weight.original0": {
+    "shape": [
+      1,
+      1,
+      128
+    ],
+    "dtype": "torch.float32"
+  },
+  "pos_conv_embed.conv.parametrizations.weight.original1": {
+    "shape": [
+      768,
+      48,
+      128
+    ],
+    "dtype": "torch.float32"
+  },
+  "encoder_ln.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "encoder_ln.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.0.attention.k_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.0.attention.k_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.0.attention.v_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.0.attention.v_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.0.attention.q_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.0.attention.q_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.0.attention.out_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.0.attention.out_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.0.layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.0.layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.0.feed_forward.intermediate_dense.weight": {
+    "shape": [
+      3072,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.0.feed_forward.intermediate_dense.bias": {
+    "shape": [
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.0.feed_forward.output_dense.weight": {
+    "shape": [
+      768,
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.0.feed_forward.output_dense.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.0.final_layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.0.final_layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.1.attention.k_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.1.attention.k_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.1.attention.v_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.1.attention.v_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.1.attention.q_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.1.attention.q_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.1.attention.out_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.1.attention.out_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.1.layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.1.layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.1.feed_forward.intermediate_dense.weight": {
+    "shape": [
+      3072,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.1.feed_forward.intermediate_dense.bias": {
+    "shape": [
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.1.feed_forward.output_dense.weight": {
+    "shape": [
+      768,
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.1.feed_forward.output_dense.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.1.final_layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.1.final_layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.2.attention.k_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.2.attention.k_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.2.attention.v_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.2.attention.v_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.2.attention.q_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.2.attention.q_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.2.attention.out_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.2.attention.out_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.2.layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.2.layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.2.feed_forward.intermediate_dense.weight": {
+    "shape": [
+      3072,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.2.feed_forward.intermediate_dense.bias": {
+    "shape": [
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.2.feed_forward.output_dense.weight": {
+    "shape": [
+      768,
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.2.feed_forward.output_dense.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.2.final_layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.2.final_layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.3.attention.k_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.3.attention.k_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.3.attention.v_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.3.attention.v_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.3.attention.q_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.3.attention.q_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.3.attention.out_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.3.attention.out_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.3.layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.3.layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.3.feed_forward.intermediate_dense.weight": {
+    "shape": [
+      3072,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.3.feed_forward.intermediate_dense.bias": {
+    "shape": [
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.3.feed_forward.output_dense.weight": {
+    "shape": [
+      768,
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.3.feed_forward.output_dense.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.3.final_layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f1_layers.3.final_layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "down.dw_conv.weight": {
+    "shape": [
+      768,
+      1,
+      3
+    ],
+    "dtype": "torch.float32"
+  },
+  "down.pw_conv.weight": {
+    "shape": [
+      768,
+      768,
+      1
+    ],
+    "dtype": "torch.float32"
+  },
+  "down.pw_conv.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "down.norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "down.norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.0.attention.k_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.0.attention.k_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.0.attention.v_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.0.attention.v_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.0.attention.q_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.0.attention.q_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.0.attention.out_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.0.attention.out_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.0.layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.0.layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.0.feed_forward.intermediate_dense.weight": {
+    "shape": [
+      3072,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.0.feed_forward.intermediate_dense.bias": {
+    "shape": [
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.0.feed_forward.output_dense.weight": {
+    "shape": [
+      768,
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.0.feed_forward.output_dense.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.0.final_layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.0.final_layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.1.attention.k_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.1.attention.k_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.1.attention.v_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.1.attention.v_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.1.attention.q_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.1.attention.q_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.1.attention.out_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.1.attention.out_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.1.layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.1.layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.1.feed_forward.intermediate_dense.weight": {
+    "shape": [
+      3072,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.1.feed_forward.intermediate_dense.bias": {
+    "shape": [
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.1.feed_forward.output_dense.weight": {
+    "shape": [
+      768,
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.1.feed_forward.output_dense.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.1.final_layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.1.final_layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.2.attention.k_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.2.attention.k_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.2.attention.v_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.2.attention.v_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.2.attention.q_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.2.attention.q_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.2.attention.out_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.2.attention.out_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.2.layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.2.layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.2.feed_forward.intermediate_dense.weight": {
+    "shape": [
+      3072,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.2.feed_forward.intermediate_dense.bias": {
+    "shape": [
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.2.feed_forward.output_dense.weight": {
+    "shape": [
+      768,
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.2.feed_forward.output_dense.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.2.final_layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.2.final_layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.3.attention.k_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.3.attention.k_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.3.attention.v_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.3.attention.v_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.3.attention.q_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.3.attention.q_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.3.attention.out_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.3.attention.out_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.3.layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.3.layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.3.feed_forward.intermediate_dense.weight": {
+    "shape": [
+      3072,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.3.feed_forward.intermediate_dense.bias": {
+    "shape": [
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.3.feed_forward.output_dense.weight": {
+    "shape": [
+      768,
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.3.feed_forward.output_dense.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.3.final_layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f2_layers.3.final_layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "up.up_conv.weight": {
+    "shape": [
+      768,
+      768,
+      2
+    ],
+    "dtype": "torch.float32"
+  },
+  "up.gate_proj.weight": {
+    "shape": [
+      1536,
+      1536
+    ],
+    "dtype": "torch.float32"
+  },
+  "up.out_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "up.norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "up.norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.0.attention.k_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.0.attention.k_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.0.attention.v_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.0.attention.v_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.0.attention.q_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.0.attention.q_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.0.attention.out_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.0.attention.out_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.0.layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.0.layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.0.feed_forward.intermediate_dense.weight": {
+    "shape": [
+      3072,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.0.feed_forward.intermediate_dense.bias": {
+    "shape": [
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.0.feed_forward.output_dense.weight": {
+    "shape": [
+      768,
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.0.feed_forward.output_dense.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.0.final_layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.0.final_layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.1.attention.k_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.1.attention.k_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.1.attention.v_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.1.attention.v_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.1.attention.q_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.1.attention.q_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.1.attention.out_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.1.attention.out_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.1.layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.1.layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.1.feed_forward.intermediate_dense.weight": {
+    "shape": [
+      3072,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.1.feed_forward.intermediate_dense.bias": {
+    "shape": [
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.1.feed_forward.output_dense.weight": {
+    "shape": [
+      768,
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.1.feed_forward.output_dense.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.1.final_layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.1.final_layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.2.attention.k_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.2.attention.k_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.2.attention.v_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.2.attention.v_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.2.attention.q_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.2.attention.q_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.2.attention.out_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.2.attention.out_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.2.layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.2.layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.2.feed_forward.intermediate_dense.weight": {
+    "shape": [
+      3072,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.2.feed_forward.intermediate_dense.bias": {
+    "shape": [
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.2.feed_forward.output_dense.weight": {
+    "shape": [
+      768,
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.2.feed_forward.output_dense.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.2.final_layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.2.final_layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.3.attention.k_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.3.attention.k_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.3.attention.v_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.3.attention.v_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.3.attention.q_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.3.attention.q_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.3.attention.out_proj.weight": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.3.attention.out_proj.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.3.layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.3.layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.3.feed_forward.intermediate_dense.weight": {
+    "shape": [
+      3072,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.3.feed_forward.intermediate_dense.bias": {
+    "shape": [
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.3.feed_forward.output_dense.weight": {
+    "shape": [
+      768,
+      3072
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.3.feed_forward.output_dense.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.3.final_layer_norm.weight": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "f3_layers.3.final_layer_norm.bias": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "feat_masking.mask_emb": {
+    "shape": [
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "head_hi.proj.weight": {
+    "shape": [
+      100,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "head_hi.proj.bias": {
+    "shape": [
+      100
+    ],
+    "dtype": "torch.float32"
+  },
+  "head_lo.proj.weight": {
+    "shape": [
+      100,
+      768
+    ],
+    "dtype": "torch.float32"
+  },
+  "head_lo.proj.bias": {
+    "shape": [
+      100
+    ],
+    "dtype": "torch.float32"
+  }
+}
