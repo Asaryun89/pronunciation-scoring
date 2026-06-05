@@ -41,6 +41,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from data.speechocean_asr import SpeechOceanASRDataset, asr_collate_fn, SCORE_KEYS
+from model.losses import PronunciationScoringLoss
 from model.pronunciation_scorer import PronunciationScorer
 from training.scheduler import get_warmup_cosine_schedule
 
@@ -107,8 +108,8 @@ def compute_loss(
 # ─────────────────────────────────────────────────────────────────────────────
 
 _STEP_COLS = (
-    ["step", "epoch", "loss"]
-    + [f"loss_{n}" for n in _DIM_NAMES]
+    ["step", "epoch", "loss",
+     "loss_huber", "loss_listmle", "loss_ccc", "loss_aux_ce"]
     + ["lr", "grad_norm", "elapsed_sec"]
 )
 _EPOCH_COLS = (
@@ -195,11 +196,19 @@ class ScorerTrainer:
         self.output_dir   = Path(tcfg["output_dir"])
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Gradient accumulation + label smoothing
-        self.accum_steps  = tcfg.get("grad_accumulation_steps", 1)
-        self.smooth_alpha = tcfg.get("label_smooth_alpha", 0.0)
-        self.mse_w        = tcfg.get("mse_weight", 0.5)
-        self.pcc_w        = tcfg.get("pcc_weight", 0.5)
+        # Gradient accumulation
+        self.accum_steps = tcfg.get("grad_accumulation_steps", 1)
+
+        # Composite loss (Upgrade 3)
+        self.criterion = PronunciationScoringLoss(
+            alpha            = tcfg.get("loss_alpha",            0.3),
+            gamma            = tcfg.get("loss_gamma",            0.2),
+            beta             = tcfg.get("loss_beta",             0.1),
+            warmup_steps     = tcfg.get("loss_warmup_steps",     1000),
+            huber_delta      = tcfg.get("loss_huber_delta",      1.0),
+            lambdas          = tcfg.get("loss_lambdas",          None),
+            label_smooth_std = tcfg.get("loss_smooth_std",       0.3),
+        )
 
         # Optimizer + scheduler (total_steps = optimizer steps, not micro-batches)
         self.optimizer    = model.get_optimizer()
@@ -260,21 +269,26 @@ class ScorerTrainer:
         n_micro      = 0
         window_loss  = 0.0
         window_micro = 0
-        window_dims: Dict[str, float] = {}
+        window_comps: Dict[str, float] = {}   # composite loss component accumulators
 
         self.optimizer.zero_grad(set_to_none=True)
 
         for micro_idx, batch in enumerate(self.train_loader):
             waveforms   = batch["waveforms"].to(self.device)
             attn_mask   = batch["attention_mask"].to(self.device)
-            targets     = batch["labels"].to(self.device)
+            # Scale labels from [0,1] (dataset) to (0,10) MOS range to match
+            # model output and PronunciationScoringLoss expectations.
+            targets_mos = batch["labels"].to(self.device) * 10.0
             transcripts = batch["transcripts"]
 
             with torch.autocast(device_type=self.device.type, enabled=use_amp):
-                pred = self.model(waveforms, attn_mask, transcripts)
-                loss, dim_losses = compute_loss(
-                    pred, targets, self.mse_w, self.pcc_w, self.smooth_alpha
+                pred      = self.model(waveforms, attn_mask, transcripts)
+                loss_dict = self.criterion(
+                    pred        = pred,
+                    target      = targets_mos,
+                    global_step = self.global_step,
                 )
+            loss = loss_dict["total"]
 
             self.scaler.scale(loss / accum_steps).backward()
 
@@ -282,8 +296,8 @@ class ScorerTrainer:
             n_micro      += 1
             window_loss  += loss.item()
             window_micro += 1
-            for k, v in dim_losses.items():
-                window_dims[k] = window_dims.get(k, 0.0) + v
+            for k in ("huber", "listmle", "ccc", "aux_ce"):
+                window_comps[k] = window_comps.get(k, 0.0) + loss_dict[k].item()
 
             is_boundary = (micro_idx + 1) % accum_steps == 0
             is_last     = (micro_idx + 1) == len(self.train_loader)
@@ -299,32 +313,35 @@ class ScorerTrainer:
                 self.optimizer.zero_grad(set_to_none=True)
                 self.global_step += 1
 
-                step_loss = window_loss  / window_micro
-                step_dims = {k: v / window_micro for k, v in window_dims.items()}
+                step_loss  = window_loss  / window_micro
+                step_comps = {k: v / window_micro for k, v in window_comps.items()}
 
                 if self.global_step % log_every == 0:
-                    dim_str = "  ".join(
-                        f"{name[:3]}={step_dims[f'loss_{name}']:.3f}"
-                        for name in _DIM_NAMES
+                    comp_str = "  ".join(
+                        f"{k}={step_comps.get(k, 0.0):.3f}"
+                        for k in ("huber", "listmle", "ccc")
                     )
                     log.info(
                         "[Ep %d | Step %d] loss=%.4f  %s  lr=%.2e gnorm=%.2f | %s",
-                        epoch, self.global_step, step_loss, dim_str,
+                        epoch, self.global_step, step_loss, comp_str,
                         self._current_lr(), grad_norm, self._elapsed_str(),
                     )
                     self._step_csv.write({
-                        "step":        self.global_step,
-                        "epoch":       epoch,
-                        "loss":        _fmt(step_loss),
-                        **{k: _fmt(step_dims[k]) for k in step_dims},
-                        "lr":          _fmt(self._current_lr(), prec=8),
-                        "grad_norm":   _fmt(grad_norm),
-                        "elapsed_sec": self._elapsed(),
+                        "step":          self.global_step,
+                        "epoch":         epoch,
+                        "loss":          _fmt(step_loss),
+                        "loss_huber":    _fmt(step_comps.get("huber",   0.0)),
+                        "loss_listmle":  _fmt(step_comps.get("listmle", 0.0)),
+                        "loss_ccc":      _fmt(step_comps.get("ccc",     0.0)),
+                        "loss_aux_ce":   _fmt(step_comps.get("aux_ce",  0.0)),
+                        "lr":            _fmt(self._current_lr(), prec=8),
+                        "grad_norm":     _fmt(grad_norm),
+                        "elapsed_sec":   self._elapsed(),
                     })
 
                 window_loss  = 0.0
                 window_micro = 0
-                window_dims  = {}
+                window_comps = {}
 
         return total_loss / max(1, n_micro)
 
@@ -341,14 +358,15 @@ class ScorerTrainer:
         for batch in self.val_loader:
             waveforms   = batch["waveforms"].to(self.device)
             attn_mask   = batch["attention_mask"].to(self.device)
-            targets     = batch["labels"]
+            # labels are in [0, 1]; scale to (0, 10) to match model output.
+            targets_mos = batch["labels"].float() * 10.0
             transcripts = batch["transcripts"]
             pred        = self.model(waveforms, attn_mask, transcripts)
             all_pred.append(pred.cpu().float().numpy())
-            all_target.append(targets.float().numpy())
+            all_target.append(targets_mos.numpy())
 
-        preds   = np.concatenate(all_pred,   axis=0)   # [N, 5]
-        targets = np.concatenate(all_target, axis=0)   # [N, 5]
+        preds   = np.concatenate(all_pred,   axis=0)   # [N, 4] ∈ (0, 10)
+        targets = np.concatenate(all_target, axis=0)   # [N, 4] ∈ (0, 10)
 
         metrics: Dict[str, float] = {}
         for i, key in enumerate(_DIM_NAMES):
