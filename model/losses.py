@@ -101,6 +101,12 @@ class ListMLERankingLoss(nn.Module):
             _, sort_idx  = target[:, d].sort(descending=True)
             pred_sorted  = pred[:, d][sort_idx]         # [B]
 
+            # Z-score normalise before ranking loss: prevents raw MOS scale
+            # (0-10) from inflating log-sum-exp and dominating Huber.
+            # Observed mean=0.475 (std 0.122) reduced to ~0.1-0.2 range.
+            pred_sorted = (pred_sorted - pred_sorted.mean()) / \
+                          (pred_sorted.std(unbiased=False) + 1e-8)
+
             loss_d = pred.new_zeros(1)
             for i in range(B):
                 suffix   = pred_sorted[i:]              # [B-i]
@@ -180,8 +186,10 @@ class PronunciationScoringLoss(nn.Module):
     [0, 10].  Regularises round-number clustering in human annotations.
 
     Args:
-        alpha:            ListMLE weight (default 0.3)
-        gamma:            CCC weight (default 0.2)
+        alpha:            ListMLE weight (default 0.15 — reduced from 0.30;
+                          ListMLE raw mean was 2.89× Huber, causing oscillation)
+        gamma:            CCC weight (default 0.35 — raised from 0.20;
+                          MSE did not converge with γ=0.20, CCC std=0.175)
         beta:             Auxiliary phoneme CE weight (default 0.1)
         warmup_steps:     Steps before alpha/gamma activate (default 1000)
         huber_delta:      Huber transition point in MOS units (default 1.0)
@@ -191,8 +199,8 @@ class PronunciationScoringLoss(nn.Module):
 
     def __init__(
         self,
-        alpha:            float = 0.3,
-        gamma:            float = 0.2,
+        alpha:            float = 0.15,
+        gamma:            float = 0.35,
         beta:             float = 0.1,
         warmup_steps:     int   = 1000,
         huber_delta:      float = 1.0,

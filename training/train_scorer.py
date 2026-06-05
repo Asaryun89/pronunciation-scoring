@@ -43,7 +43,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from data.speechocean_asr import SpeechOceanASRDataset, asr_collate_fn, SCORE_KEYS
 from model.losses import PronunciationScoringLoss
 from model.pronunciation_scorer import PronunciationScorer
+from training.early_stopping import EarlyStopping
 from training.scheduler import get_warmup_cosine_schedule
+
+# Sub-path B: pseudo-phoneme labeller (wav2vec2 CTC).
+# Graceful fallback: if the model cannot be downloaded, labeller is None
+# and phoneme_logits/phoneme_labels will be passed as None each step.
+try:
+    from data.pseudo_phoneme_labels import PseudoPhonemeLabeller
+    _PSEUDO_LABELLER_AVAILABLE = True
+except ImportError:
+    _PSEUDO_LABELLER_AVAILABLE = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -199,10 +209,12 @@ class ScorerTrainer:
         # Gradient accumulation
         self.accum_steps = tcfg.get("grad_accumulation_steps", 1)
 
-        # Composite loss (Upgrade 3)
+        # Composite loss — rebalanced defaults based on run_20260605 analysis:
+        #   ListMLE mean 0.475 was 2.89× Huber → alpha 0.30→0.15
+        #   CCC std 0.175 / MSE not converging → gamma 0.20→0.35
         self.criterion = PronunciationScoringLoss(
-            alpha            = tcfg.get("loss_alpha",            0.3),
-            gamma            = tcfg.get("loss_gamma",            0.2),
+            alpha            = tcfg.get("loss_alpha",            0.15),
+            gamma            = tcfg.get("loss_gamma",            0.35),
             beta             = tcfg.get("loss_beta",             0.1),
             warmup_steps     = tcfg.get("loss_warmup_steps",     1000),
             huber_delta      = tcfg.get("loss_huber_delta",      1.0),
@@ -228,10 +240,37 @@ class ScorerTrainer:
             enabled = tcfg.get("use_amp", True) and self.device.type == "cuda"
         )
 
+        # Early stopping (Phase 3) — replaces manual patience_count tracking.
+        metric_key = tcfg.get("best_metric", "val_pcc_total")
+        self.early_stop = EarlyStopping(
+            patience        = tcfg.get("patience",  5),
+            min_delta       = tcfg.get("min_delta", 0.001),
+            mode            = "max",
+            checkpoint_path = str(self.output_dir / "best_model.pt"),
+            verbose         = True,
+        )
+        self._metric_key = metric_key
+
+        # Phoneme pseudo-labeller (Phase 4 Sub-path B).
+        # Initialised lazily on first use to avoid slowing down startup.
+        self._pseudo_labeller = None
+        if _PSEUDO_LABELLER_AVAILABLE and tcfg.get("use_phoneme_aux", True):
+            try:
+                self._pseudo_labeller = PseudoPhonemeLabeller(
+                    model_name = tcfg.get("phoneme_model",
+                                          "facebook/wav2vec2-base"),
+                    device     = str(self.device),
+                )
+                log.info("PseudoPhonemeLabeller ready (%s).",
+                         tcfg.get("phoneme_model", "facebook/wav2vec2-base"))
+            except Exception as exc:
+                log.warning(
+                    "PseudoPhonemeLabeller init failed (%s) — "
+                    "phoneme aux loss disabled.", exc
+                )
+
         # State
-        self.best_metric   = float("-inf")
-        self.patience_count = 0
-        self.best_ckpt_path: Optional[Path] = None
+        self.best_metric   = float("-inf")   # kept for load_checkpoint compat
         self._last_ckpts:    List[Path]     = []
         self.global_step   = 0
         self.start_epoch   = 0
@@ -254,6 +293,28 @@ class ScorerTrainer:
     def _current_lr(self) -> float:
         return self.optimizer.param_groups[0]["lr"]
 
+    def _get_phoneme_labels(
+        self,
+        waveforms: torch.Tensor,
+        epoch:     int,
+    ) -> Optional[torch.Tensor]:
+        """
+        Returns flat [B*T'] phoneme pseudo-labels for the current batch,
+        or None if the labeller is unavailable or epoch > 3.
+
+        Only active for epochs 1-3 (before detach schedule disengages).
+        Runs every step (profile on your hardware; use `global_step % 4`
+        gating in scoring_config.yaml via use_phoneme_aux=false if too slow).
+        """
+        if self._pseudo_labeller is None or epoch > 3:
+            return None
+        try:
+            labels = self._pseudo_labeller.get_labels(waveforms)  # [B, T']
+            return labels.view(-1)                                  # [B*T']
+        except Exception as exc:
+            log.debug("Phoneme label generation failed: %s", exc)
+            return None
+
     # ──────────────────────────────────────────────────────────────────────
     # Training epoch (gradient accumulation)
     # ──────────────────────────────────────────────────────────────────────
@@ -263,7 +324,9 @@ class ScorerTrainer:
         accum_steps = self.accum_steps
         log_every   = self.tcfg.get("log_every", 20)
         use_amp     = self.tcfg.get("use_amp", True) and self.device.type == "cuda"
-        grad_clip   = self.tcfg.get("grad_clip", 1.0)
+        # grad_clip=3.0: observed normal range 2.06-3.20 passes through;
+        # 4 spikes (5.0-6.2) are clipped. Old default 1.0 was too aggressive.
+        grad_clip   = self.tcfg.get("grad_clip", 3.0)
 
         total_loss   = 0.0
         n_micro      = 0
@@ -281,12 +344,20 @@ class ScorerTrainer:
             targets_mos = batch["labels"].to(self.device) * 10.0
             transcripts = batch["transcripts"]
 
+            # Phoneme pseudo-labels (Sub-path B via PseudoPhonemeLabeller).
+            # Returns None when labeller is unavailable or epoch > 3.
+            phoneme_labels_flat = self._get_phoneme_labels(waveforms, epoch)
+
             with torch.autocast(device_type=self.device.type, enabled=use_amp):
-                pred      = self.model(waveforms, attn_mask, transcripts)
+                pred          = self.model(waveforms, attn_mask, transcripts,
+                                           current_epoch=epoch)
+                phoneme_logits = getattr(self.model, "last_phoneme_logits", None)
                 loss_dict = self.criterion(
-                    pred        = pred,
-                    target      = targets_mos,
-                    global_step = self.global_step,
+                    pred           = pred,
+                    target         = targets_mos,
+                    global_step    = self.global_step,
+                    phoneme_logits = phoneme_logits,
+                    phoneme_labels = phoneme_labels_flat,
                 )
             loss = loss_dict["total"]
 
@@ -307,6 +378,13 @@ class ScorerTrainer:
                 grad_norm = nn.utils.clip_grad_norm_(
                     self.model.parameters(), grad_clip
                 ).item()
+                # Warn on pre-clip spikes: training log showed 4 spikes >5.0,
+                # max 6.165. Threshold 4.0 catches outliers without noise.
+                if grad_norm > 4.0:
+                    log.warning(
+                        "[WARN] grad norm spike %.3f at step %d (clipped to %.1f)",
+                        grad_norm, self.global_step + 1, grad_clip,
+                    )
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.scheduler.step()
@@ -400,28 +478,16 @@ class ScorerTrainer:
         return path
 
     def _manage_checkpoints(self, epoch: int, val_metrics: Dict[str, float]) -> None:
-        tcfg       = self.tcfg
-        save_every = tcfg.get("save_every_n_epochs", 5)
-        keep_n     = tcfg.get("keep_last_n_checkpoints", 3)
-        metric_key = tcfg.get("best_metric", "val_pcc_total")
-        min_delta  = tcfg.get("min_delta", 0.001)
-        current    = val_metrics.get(metric_key, float("-inf"))
-
-        if current - self.best_metric > min_delta:
-            self.best_metric    = current
-            self.patience_count = 0
-            self.best_ckpt_path = self._save("best_model.pt", epoch, val_metrics)
-            log.info("  * New best %s=%.4f → best_model.pt", metric_key, current)
-        else:
-            self.patience_count += 1
-
+        """Save rolling last-N checkpoints. Best-model save is handled by EarlyStopping."""
+        save_every = self.tcfg.get("save_every_n_epochs", 5)
+        keep_n     = self.tcfg.get("keep_last_n_checkpoints", 3)
         if epoch % save_every == 0:
             name = f"last_epoch_{epoch:03d}.pt"
             p    = self._save(name, epoch, val_metrics)
             self._last_ckpts.append(p)
             while len(self._last_ckpts) > keep_n:
                 old = self._last_ckpts.pop(0)
-                if old.exists() and old != self.best_ckpt_path:
+                if old.exists():
                     old.unlink()
 
     # ──────────────────────────────────────────────────────────────────────
@@ -452,7 +518,7 @@ class ScorerTrainer:
         widths = self._COL_W
         pcc    = [val_metrics.get(f"val_pcc_{k}", float("nan")) for k in _DIM_NAMES]
         mse    = val_metrics.get("val_mse_total", float("nan"))
-        best   = self.patience_count == 0   # just improved
+        best   = self.early_stop.counter == 0 and self.early_stop.best_score is not None
 
         def _f(v: float, w: int, prec: int = 4) -> str:
             s = f"{v:.{prec}f}" if not math.isnan(v) else "  nan"
@@ -479,9 +545,7 @@ class ScorerTrainer:
     def train(self) -> None:
         tcfg       = self.tcfg
         epochs     = tcfg["epochs"]
-        patience   = tcfg.get("patience", 10)
-        early_stop = tcfg.get("early_stopping", True)
-        metric_key = tcfg.get("best_metric", "val_pcc_total")
+        metric_key = self._metric_key
 
         log.info(
             "Training PronunciationScorer | device=%s | epochs=%d | "
@@ -498,24 +562,47 @@ class ScorerTrainer:
             mse_total = val_metrics.get("val_mse_total", float("nan"))
             lr        = self._current_lr()
 
+            # EarlyStopping: tracks best, saves best_model.pt, returns stop flag.
+            current_score = val_metrics.get(metric_key, float("-inf"))
+            should_stop   = self.early_stop.step(
+                score       = current_score,
+                model       = self.model,
+                epoch       = epoch,
+                extra_state = {
+                    "optimizer_state": self.optimizer.state_dict(),
+                    "scheduler_state": self.scheduler.state_dict(),
+                    "scaler_state":    self.scaler.state_dict(),
+                    "global_step":     self.global_step,
+                    "epoch":           epoch,
+                    "best_metric":     self.early_stop.best_score or float("-inf"),
+                    "val_metrics":     val_metrics,
+                    "config":          self.cfg,
+                    "run_dir":         str(self.run_dir),
+                },
+            )
+            self.best_metric = self.early_stop.best_score or float("-inf")
+
             self._manage_checkpoints(epoch, val_metrics)
             self._print_epoch_row(epoch, epochs, train_loss, val_metrics, lr)
 
             self._val_csv.write({
-                "epoch":        epoch,
-                "step":         self.global_step,
-                "train_loss":   _fmt(train_loss),
-                **{f"val_pcc_{k}": _fmt(val_metrics.get(f"val_pcc_{k}")) for k in _DIM_NAMES},
+                "epoch":         epoch,
+                "step":          self.global_step,
+                "train_loss":    _fmt(train_loss),
+                **{f"val_pcc_{k}": _fmt(val_metrics.get(f"val_pcc_{k}"))
+                   for k in _DIM_NAMES},
                 "val_mse_total": _fmt(mse_total),
-                "lr":           _fmt(lr, prec=8),
-                "elapsed_sec":  self._elapsed(),
+                "lr":            _fmt(lr, prec=8),
+                "elapsed_sec":   self._elapsed(),
             })
 
-            self._manage_checkpoints(epoch, val_metrics)
-
-            if early_stop and self.patience_count >= patience:
+            if should_stop:
                 log.info(
-                    "Early stopping: %s not improved for %d epochs.", metric_key, patience
+                    "Early stopping fired at epoch %d — "
+                    "best %s=%.4f at epoch %d.",
+                    epoch, metric_key,
+                    self.early_stop.best_score or float("-inf"),
+                    self.early_stop.best_epoch,
                 )
                 break
 
@@ -523,8 +610,9 @@ class ScorerTrainer:
         self._val_csv.close()
         log.info(
             "Training complete. Best %s=%.4f → %s",
-            metric_key, self.best_metric,
-            self.best_ckpt_path or "not saved",
+            metric_key,
+            self.early_stop.best_score or float("-inf"),
+            self.early_stop.checkpoint_path,
         )
 
     # ──────────────────────────────────────────────────────────────────────
@@ -537,8 +625,15 @@ class ScorerTrainer:
             migrate_audio_proj,
         )
 
-        ckpt         = torch.load(path, map_location=self.device, weights_only=False)
-        model_state  = ckpt["model_state"]
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        # Support both key formats:
+        #   _save()         → "model_state"      (legacy format)
+        #   EarlyStopping   → "model_state_dict" (Phase 3 best_model.pt)
+        model_state = ckpt.get("model_state") or ckpt.get("model_state_dict")
+        if model_state is None:
+            raise KeyError(
+                f"Checkpoint {path} missing 'model_state' or 'model_state_dict'."
+            )
 
         # Stash old architecture tensors before load so we can migrate them
         # if the checkpoint predates the dim-conditioned layer_weights upgrade.

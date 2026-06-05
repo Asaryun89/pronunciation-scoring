@@ -2,7 +2,7 @@
 # Multi-resolution HuBERT + Qwen3 Cross-Attention Pronunciation Scorer
 #
 # Architecture:
-#   Audio: FlatHuBERT (pretrained) → weighted sum of 12 layers
+#   Audio: MultiResHuBERT (pretrained) → weighted sum of 12 layers
 #          → Linear(768, 256) → TransformerEncoder ×1  (Q)
 #   Text:  Faster-Whisper ASR → Qwen3-Embedding-0.6B → mask-aware mean pool
 #          → Linear(1024, 256) + LayerNorm             (K/V)
@@ -34,7 +34,7 @@ model:
   # NOTE: speech_hidden_dim must match the pretrained checkpoint's HuBERT size.
   #   hubert-base-ls960  → speech_hidden_dim: 768,  layers: 4+4+4  = 12
   #   hubert-large-ll60k → speech_hidden_dim: 1024, layers: 8+8+8  = 24
-  pretrain_checkpoint:      "../checkpoints/pretrain/best_model.pt"
+  pretrain_checkpoint:      "../checkpoints/pretrain/final_pretrain.pt"
   hubert_model_name:        "facebook/hubert-base-ls960"
   f1_layer_count:           4
   f2_layer_count:           4
@@ -77,33 +77,48 @@ model:
   score_dims:           ["total", "accuracy", "fluency", "prosodic"]
   scoring_dropout:      0.1
 
+  # ── Auxiliary phoneme head (Phase 4) ─────────────────────────────────────
+  num_phonemes:         40           # reduced Arpabet set
+
 training:
   output_dir:               "../checkpoints/scorer"
   epochs:                   50
   lr_speech_encoder:        5.0e-5   # param group A — MultiResHuBERT backbone
   lr_audio_proj:            1.0e-4   # param group B — proj + layer_weights + pre-fusion
   lr_text_encoder:          0.0      # param group C — Qwen3 (frozen)
-  lr_fusion:                1.0e-4   # param group D — cross-attn + post-fusion + head
+  lr_fusion:                1.0e-4   # param group D — cross-attn + post-fusion + scoring + phoneme head
   min_lr:                   1.0e-6
   lr_scheduler:             "cosine"
   warmup_steps:             500
   optimizer:                "adamw"
   weight_decay:             1.0e-2
   betas:                    [0.9, 0.98]
-  grad_clip:                1.0
+  grad_clip:                3.0      # raised from 1.0; normal range 2.06-3.20, spikes 5.0-6.2
   grad_accumulation_steps:  2
   use_amp:                  true
   device:                   "cuda"
-  mse_weight:               0.5
-  pcc_weight:               0.5
-  label_smooth_alpha:       0.05
   save_every_n_epochs:      5
   keep_last_n_checkpoints:  3
   best_metric:              "val_pcc_total"
-  early_stopping:           true
-  patience:                 10
+  patience:                 5        # tightened from 10; rebalanced loss converges earlier
   min_delta:                0.001
   log_every:                20
+
+  # ── Composite loss (Upgrade 3 / Phase 1 rebalanced) ──────────────────────
+  # Justified by run_20260605 analysis:
+  #   ListMLE mean=0.475 (2.89× Huber) → alpha 0.30→0.15
+  #   CCC std=0.175, MSE not converging → gamma 0.20→0.35
+  loss_alpha:               0.15
+  loss_gamma:               0.35
+  loss_beta:                0.10
+  loss_warmup_steps:        1000
+  loss_huber_delta:         1.0
+  loss_lambdas:             [1.0, 1.0, 0.5, 1.0]  # lower weight on prosodic
+  loss_smooth_std:          0.3
+
+  # ── Phase 4: auxiliary phoneme CE ────────────────────────────────────────
+  use_phoneme_aux:          true     # set false to disable without code change
+  phoneme_model:            "facebook/wav2vec2-base"  # CTC model for Sub-path B
 
 logging:
   use_tb:       true
