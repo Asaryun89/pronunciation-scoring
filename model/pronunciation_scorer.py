@@ -1,19 +1,22 @@
 """
 Full pronunciation scoring model — wires all components together.
 
-Forward pass:
+Forward pass (Upgrade 2):
     waveform, attention_mask, transcripts
     → AudioEncoder          → pre_fused  4 × [B, T', proj_dim]
                                [0]=accuracy  [1]=fluency
                                [2]=prosodic  [3]=total (Q for fusion)
-    → Qwen3MeanPoolEncoder  → text_emb [B, text_dim]
-    → CrossAttentionFusion  → fused    [B, T', proj_dim]  (uses pre_fused[3] as Q)
-    → TransformerEncoder ×2 → fused    [B, T', proj_dim]
+    → TokenTextProjection   → text_feats [B, N, proj_dim]
+                               text_pad   [B, N] bool (True = pad)
+    → CrossAttentionFusion  → fused      [B, T', proj_dim]
+                               (Q=pre_fused[3], K/V=text_feats[all N tokens])
+    → TransformerEncoder ×2 → fused      [B, T', proj_dim]
     → masked mean pool × 4  → pooled_{tot,acc,flu,pro}  [B, proj_dim]
-    → 4 × _DimHead          → scores   [B, 4]  in (0, 1)
+    → 4 × _DimHead          → scores     [B, 4]  in (0, 1) × 10 = (0, 10) MOS
 
-Scores are in [0, 1] to match SpeechOcean762 labels normalised to [0, 1].
-Multiply by 10 for MOS display only (do not scale before computing loss).
+Scores are in (0, 10) to match SpeechOcean762 raw MOS range.
+Dataset labels are pre-normalised to [0, 1]; multiply labels by 10 before
+passing to PronunciationScoringLoss (see training/train_scorer.py).
 """
 
 from __future__ import annotations
@@ -26,10 +29,11 @@ import torch.nn as nn
 from torch import Tensor
 from torch.optim import AdamW
 
-from .audio_encoder        import AudioEncoder
-from .text_encoder_qwen3   import Qwen3MeanPoolEncoder
+from .audio_encoder          import AudioEncoder
+from .text_encoder_qwen3     import Qwen3MeanPoolEncoder   # used only as a fallback type alias
+from .text_projection        import TokenTextProjection
 from .cross_attention_fusion import CrossAttentionFusion
-from .scoring_head         import MLPScoringHead
+from .scoring_head           import MLPScoringHead
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +41,14 @@ log = logging.getLogger(__name__)
 class PronunciationScorer(nn.Module):
     """
     Multi-resolution HuBERT + Qwen3 cross-attention pronunciation scorer.
+
+    Key attributes (for validation / gradient checks):
+        audio_encoder.layer_weights  [4, 12]
+        audio_encoder.proj           ModuleList of 4 Linear(768, 256)
+        text_projection              TokenTextProjection (forward → seq + mask)
+        text_projection.proj         Linear(1024, 256)  — trainable
+        cross_attn_fusion            CrossAttentionFusion
+        cross_attn_fusion.mha        nn.MultiheadAttention
 
     Args:
         cfg: Full config dict.
@@ -51,17 +63,15 @@ class PronunciationScorer(nn.Module):
         # ── Audio path ──────────────────────────────────────────────────────
         self.audio_encoder = AudioEncoder(cfg)
 
-        # ── Text path ───────────────────────────────────────────────────────
-        self.text_encoder = Qwen3MeanPoolEncoder(
-            model_name   = mcfg["text_encoder_name"],
-            max_length   = mcfg.get("text_max_length", 128),
-            frozen       = mcfg.get("freeze_text_encoder", True),
-            padding_side = mcfg.get("text_padding_side", "left"),
-        )
-        self._text_dim = mcfg["text_encoder_dim"]
+        # ── Text path (Upgrade 2) ────────────────────────────────────────────
+        # TokenTextProjection wraps frozen Qwen3 + trainable Linear+LN.
+        # Returns (token_seq [B,N,256], key_padding_mask [B,N]).
+        self.text_projection = TokenTextProjection(cfg)
+        self._proj_dim = proj_dim   # used in speech_only zero-tensor
 
-        # ── Cross-attention fusion ───────────────────────────────────────────
-        self.fusion = CrossAttentionFusion(cfg)
+        # ── Cross-attention fusion (Upgrade 2) ───────────────────────────────
+        # Accepts per-token K/V sequence; renamed from self.fusion.
+        self.cross_attn_fusion = CrossAttentionFusion(cfg)
 
         # ── Post-fusion transformer (2 layers, pre-LN) ─────────────────────
         post_layer = nn.TransformerEncoderLayer(
@@ -87,6 +97,13 @@ class PronunciationScorer(nn.Module):
         self._wd        = tcfg.get("weight_decay", 1e-2)
         self._betas     = tuple(tcfg.get("betas", [0.9, 0.98]))
 
+    # ── Backward-compat alias ─────────────────────────────────────────────
+    # Some existing test code and evaluation scripts access self.text_encoder.
+    # Return the text_projection module so they still get parameters/device.
+    @property
+    def text_encoder(self):
+        return self.text_projection
+
     # ──────────────────────────────────────────────────────────────────────
     # Forward
     # ──────────────────────────────────────────────────────────────────────
@@ -103,59 +120,63 @@ class PronunciationScorer(nn.Module):
             waveforms:       Raw 16 kHz audio, zero-padded.    [B, T_audio]
             attention_mask:  Integer mask (1=real, 0=pad).      [B, T_audio]
             transcripts:     Utterance transcripts.             List[str]
-            speech_only:     If True, replace text_emb with zeros (ablation).
+            speech_only:     If True, replace text with a single zero token.
 
         Returns:
-            [B, 4] — scores in (0, 1).
+            [B, 4] — scores in (0, 10) MOS range.
                      Order: [total, accuracy, fluency, prosodic].
-                     Multiply by 10 for MOS display only.
         """
         # ── Audio path ──────────────────────────────────────────────────────
         # Returns 4 × [B, T', proj_dim]:
         #   [0]=accuracy  [1]=fluency  [2]=prosodic  [3]=total
         pre_fused = self.audio_encoder(waveforms, attention_mask)
+        B, T_feat = pre_fused[3].shape[0], pre_fused[3].shape[1]
+        dtype     = pre_fused[3].dtype
+        device    = pre_fused[3].device
 
-        # ── Text path ───────────────────────────────────────────────────────
+        # ── Text path (Upgrade 2: per-token sequence) ────────────────────────
         if speech_only:
-            text_emb = torch.zeros(
-                waveforms.shape[0], self._text_dim,
-                device=waveforms.device, dtype=pre_fused[3].dtype,
-            )
+            # Single zero token — cross-attention will attend to nothing.
+            text_feats   = torch.zeros(B, 1, self._proj_dim,
+                                        device=device, dtype=dtype)
+            text_pad_mask = torch.zeros(B, 1, dtype=torch.bool, device=device)
         else:
-            text_emb = self.text_encoder(transcripts).to(
-                device=pre_fused[3].device, dtype=pre_fused[3].dtype,
-            )                                                    # [B, text_dim]
+            text_feats, text_pad_mask = self.text_projection(transcripts)
+            text_feats = text_feats.to(device=device, dtype=dtype)
+            text_pad_mask = text_pad_mask.to(device=device)
 
         # ── Cross-attention fusion (total stream as Q) ───────────────────────
-        fused = self.fusion(pre_fused[3], text_emb)             # [B, T', proj_dim]
+        fused = self.cross_attn_fusion(
+            query            = pre_fused[3],
+            key_value        = text_feats,
+            key_padding_mask = text_pad_mask,
+        )                                                    # [B, T', proj_dim]
 
         # ── Post-fusion transformer ──────────────────────────────────────────
-        T_feat    = fused.shape[1]
         feat_mask = self.audio_encoder.backbone._audio_mask_to_feat_mask(
             attention_mask, T_feat
         ) if attention_mask is not None else \
-            torch.ones(fused.shape[:2], dtype=torch.bool, device=fused.device)
-        pad_mask = ~feat_mask                                    # [B, T'] True=ignore
+            torch.ones(B, T_feat, dtype=torch.bool, device=device)
+        pad_mask = ~feat_mask                                # [B, T'] True=ignore
 
         fused = self.post_fusion(fused, src_key_padding_mask=pad_mask)
-                                                                 # [B, T', proj_dim]
 
         # ── Masked mean pool ─────────────────────────────────────────────────
-        m = feat_mask.unsqueeze(-1).float()                      # [B, T', 1]
+        m = feat_mask.unsqueeze(-1).float()                  # [B, T', 1]
 
         def _masked_mean(x: Tensor) -> Tensor:
-            return (x * m).sum(1) / m.sum(1).clamp(min=1e-6)    # [B, proj_dim]
+            return (x * m).sum(1) / m.sum(1).clamp(min=1e-6)
 
-        pooled_tot = _masked_mean(fused)                         # post-fusion total
-        pooled_acc = _masked_mean(pre_fused[0])                  # pre-fusion accuracy
-        pooled_flu = _masked_mean(pre_fused[1])                  # pre-fusion fluency
-        pooled_pro = _masked_mean(pre_fused[2])                  # pre-fusion prosodic
+        pooled_tot = _masked_mean(fused)                     # post-fusion total
+        pooled_acc = _masked_mean(pre_fused[0])
+        pooled_flu = _masked_mean(pre_fused[1])
+        pooled_pro = _masked_mean(pre_fused[2])
 
         # ── Per-dimension scoring ────────────────────────────────────────────
-        score_tot = self.scoring_head.total_mlp(pooled_tot)      # [B, 1]
-        score_acc = self.scoring_head.accuracy_mlp(pooled_acc)   # [B, 1]
-        score_flu = self.scoring_head.fluency_mlp(pooled_flu)    # [B, 1]
-        score_pro = self.scoring_head.prosodic_mlp(pooled_pro)   # [B, 1]
+        score_tot = self.scoring_head.total_mlp(pooled_tot)
+        score_acc = self.scoring_head.accuracy_mlp(pooled_acc)
+        score_flu = self.scoring_head.fluency_mlp(pooled_flu)
+        score_pro = self.scoring_head.prosodic_mlp(pooled_pro)
 
         # Order matches SCORE_DIMS = ["total", "accuracy", "fluency", "prosodic"]
         return torch.cat([score_tot, score_acc, score_flu, score_pro], dim=1) * 10
@@ -170,28 +191,30 @@ class PronunciationScorer(nn.Module):
           A — audio_encoder.backbone (MultiResHuBERT)   lr = lr_speech_encoder
           B — audio_encoder layer_weights / proj[0-3] / pre_transformer
                                                         lr = lr_audio_proj
-          C — text_encoder                               lr = lr_text_encoder (0.0)
-          D — fusion + post_fusion + scoring_head        lr = lr_fusion
+          C — text_projection.text_model (Qwen3, frozen) lr = lr_text_encoder (0)
+          D — text_projection.proj/norm + cross_attn_fusion + post_fusion
+              + scoring_head                            lr = lr_fusion
         """
         ae = self.audio_encoder
 
         # Group A: backbone trainable params
         speech_params = [p for p in ae.backbone.parameters() if p.requires_grad]
 
-        # Group B: layer_weights, 4-head projection, pre-fusion transformer
+        # Group B: audio encoder (layer_weights, 4-head proj, pre-transformer)
         proj_params = (
             [ae.layer_weights]
-            + list(ae.proj.parameters())          # ModuleList — all 4 heads
+            + list(ae.proj.parameters())
             + list(ae.pre_transformer.parameters())
         )
 
-        # Group C: text encoder (frozen; lr=0.0 keeps it in the param group
-        # so the optimizer state is saved/restored correctly on resume)
-        text_params = list(self.text_encoder.parameters())
+        # Group C: frozen Qwen3 LM backbone (lr=0 keeps optimizer state intact)
+        text_params = list(self.text_projection.text_model.parameters())
 
-        # Group D: fusion modules + scoring head
+        # Group D: trainable text proj head + fusion + scoring
         fusion_params = (
-            list(self.fusion.parameters())
+            list(self.text_projection.proj.parameters())
+            + list(self.text_projection.norm.parameters())
+            + list(self.cross_attn_fusion.parameters())
             + list(self.post_fusion.parameters())
             + list(self.scoring_head.parameters())
         )

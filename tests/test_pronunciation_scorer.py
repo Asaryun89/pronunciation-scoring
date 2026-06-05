@@ -1,26 +1,26 @@
 """
 Tests for model/pronunciation_scorer.py — PronunciationScorer.
 
-Uses stub AudioEncoder + stub text encoder so no HF model downloads occur.
+Uses stub AudioEncoder + stub TokenTextProjection so no HF model downloads.
 The real CrossAttentionFusion, post-fusion transformer, and MLPScoringHead
 are tested end-to-end.
 
 Updated for:
-  - Upgrade 1: AudioEncoder returns List[4 × Tensor]; proj is a ModuleList.
-  - Phase 0 Fix 1: model output is in (0, 10) MOS range (sigmoid × 10).
+  - Upgrade 1: AudioEncoder returns List[4×Tensor]; proj is a ModuleList.
+  - Upgrade 2: text path uses TokenTextProjection → (seq [B,N,256], mask [B,N]).
+  - Phase 0 Fix 1: model output is in (0, 10) MOS range.
 """
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Tuple
 from unittest.mock import patch
 
 import pytest
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -36,6 +36,7 @@ TEXT_DIM = 1024
 T_FEAT   = 30
 N_LAYERS = 12
 H_DIM    = 768
+N_TOK    = 10   # synthetic token count
 B        = 4
 T_AUDIO  = 8000
 
@@ -60,7 +61,6 @@ class _FakeBackbone(nn.Module):
         B = wav.shape[0]
         all_hs = None
         if output_hidden_states:
-            # Non-zero values so proj.weight receives a non-zero gradient.
             all_hs = [torch.ones(B, T_FEAT, H_DIM) for _ in range(N_LAYERS)]
         return _FakeOutput(all_hs)
 
@@ -71,23 +71,27 @@ class _FakeBackbone(nn.Module):
     def parameters(self, recurse=True): yield self._p
 
 
-class _FakeTextEncoder(nn.Module):
+class _FakeTokenTextProjection(nn.Module):
+    """
+    Stub for TokenTextProjection.
+    Returns a token sequence [B, N_TOK, PROJ_DIM] and an all-zeros mask
+    (no padding), so cross-attention is exercised without loading Qwen3.
+    """
     def __init__(self, *a, **kw) -> None:
         super().__init__()
-        self._frozen = kw.get("frozen", True)
-        self._linear = nn.Linear(8, TEXT_DIM)
-        if self._frozen:
-            for p in self._linear.parameters():
-                p.requires_grad_(False)
+        # Expose the same sub-attributes the scorer and tests access.
+        self.proj = nn.Linear(TEXT_DIM, PROJ_DIM)
+        self.norm = nn.LayerNorm(PROJ_DIM)
+        # text_model used by optimizer Group C and grad-check name matching
+        self.text_model = nn.Linear(8, 8)
+        for p in self.text_model.parameters():
+            p.requires_grad_(False)
 
-    def forward(self, transcripts: List[str]) -> Tensor:
+    def forward(self, transcripts: List[str]) -> Tuple[Tensor, Tensor]:
         B = len(transcripts)
-        out = F.normalize(self._linear(torch.randn(B, 8)).float(), p=2, dim=-1)
-        return out
-
-    def freeze(self): pass
-    def unfreeze(self): pass
-    def parameters(self, recurse=True): return self._linear.parameters(recurse)
+        seq  = self.norm(self.proj(torch.randn(B, N_TOK, TEXT_DIM)))
+        mask = torch.zeros(B, N_TOK, dtype=torch.bool)
+        return seq, mask
 
 
 def _make_cfg() -> dict:
@@ -115,6 +119,7 @@ def _make_cfg() -> dict:
             "text_encoder_dim":       TEXT_DIM,
             "freeze_text_encoder":    True,
             "text_max_length":        128,
+            "text_padding_side":      "left",
             "fusion_heads":           4,
             "fusion_dropout":         0.0,
             "post_fusion_heads":      4,
@@ -138,7 +143,8 @@ def _make_cfg() -> dict:
 def scorer() -> PronunciationScorer:
     cfg = _make_cfg()
     with patch("model.audio_encoder.MultiResHuBERT", _FakeBackbone), \
-         patch("model.pronunciation_scorer.Qwen3MeanPoolEncoder", _FakeTextEncoder):
+         patch("model.pronunciation_scorer.TokenTextProjection",
+               _FakeTokenTextProjection):
         return PronunciationScorer(cfg).eval()
 
 
@@ -147,7 +153,7 @@ def scorer() -> PronunciationScorer:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_output_shape(scorer: PronunciationScorer) -> None:
-    """Full forward pass must produce [B, 4] — 4 scoring dimensions."""
+    """Full forward pass must produce [B, 4]."""
     wav  = torch.randn(B, T_AUDIO)
     mask = torch.ones(B, T_AUDIO, dtype=torch.long)
     txts = ["hello"] * B
@@ -156,7 +162,7 @@ def test_output_shape(scorer: PronunciationScorer) -> None:
 
 
 def test_all_outputs_in_mos_range(scorer: PronunciationScorer) -> None:
-    """Scores must be in (0, 10) MOS range (sigmoid × 10, Fix 1)."""
+    """Scores must be in (0, 10) MOS range."""
     wav  = torch.randn(B, T_AUDIO)
     mask = torch.ones(B, T_AUDIO, dtype=torch.long)
     txts = ["THE CAT SAT ON THE MAT"] * B
@@ -169,7 +175,8 @@ def test_mos_scaling_bounded() -> None:
     """Stress test: large random inputs must still produce scores in (0, 10)."""
     cfg = _make_cfg()
     with patch("model.audio_encoder.MultiResHuBERT", _FakeBackbone), \
-         patch("model.pronunciation_scorer.Qwen3MeanPoolEncoder", _FakeTextEncoder):
+         patch("model.pronunciation_scorer.TokenTextProjection",
+               _FakeTokenTextProjection):
         model = PronunciationScorer(cfg).eval()
     for _ in range(20):
         wav  = torch.randn(2, T_AUDIO) * 10.0
@@ -180,26 +187,67 @@ def test_mos_scaling_bounded() -> None:
 
 
 def test_gradient_flows_to_audio_proj(scorer: PronunciationScorer) -> None:
-    """Backward must reach audio_encoder.proj[0].weight (ModuleList after Upgrade 1)."""
-    scorer.train()
-    wav  = torch.randn(2, T_AUDIO)
-    mask = torch.ones(2, T_AUDIO, dtype=torch.long)
-    out  = scorer(wav, mask, ["hi", "bye"])
-    out.sum().backward()
-    for d in range(4):
-        g = scorer.audio_encoder.proj[d].weight.grad
-        assert g is not None, f"audio_encoder.proj[{d}].weight has no grad"
-        assert g.abs().sum() > 0, f"audio_encoder.proj[{d}].weight grad is zero"
-
-
-def test_text_encoder_params_no_grad(scorer: PronunciationScorer) -> None:
-    """Frozen text encoder parameters must have no grad after backward."""
+    """Backward must reach all 4 audio_encoder.proj[d].weight tensors."""
     scorer.train()
     wav  = torch.randn(2, T_AUDIO)
     mask = torch.ones(2, T_AUDIO, dtype=torch.long)
     scorer(wav, mask, ["hi", "bye"]).sum().backward()
-    for p in scorer.text_encoder.parameters():
-        assert p.grad is None, "Frozen text encoder param has grad"
+    for d in range(4):
+        g = scorer.audio_encoder.proj[d].weight.grad
+        assert g is not None, f"audio_encoder.proj[{d}].weight has no grad"
+        assert g.abs().sum() > 0
+
+
+def test_cross_attn_fusion_grad(scorer: PronunciationScorer) -> None:
+    """cross_attn_fusion.mha.in_proj_weight must receive a gradient."""
+    scorer.train()
+    wav  = torch.randn(2, T_AUDIO)
+    mask = torch.ones(2, T_AUDIO, dtype=torch.long)
+    scorer(wav, mask, ["hi", "bye"]).sum().backward()
+    g = scorer.cross_attn_fusion.mha.in_proj_weight.grad
+    assert g is not None, "cross_attn_fusion.mha.in_proj_weight has no grad"
+    assert g.abs().sum() > 0
+
+
+def test_text_projection_proj_grad(scorer: PronunciationScorer) -> None:
+    """text_projection.proj.weight must receive a gradient (trainable head)."""
+    scorer.train()
+    wav  = torch.randn(2, T_AUDIO)
+    mask = torch.ones(2, T_AUDIO, dtype=torch.long)
+    scorer(wav, mask, ["hi", "bye"]).sum().backward()
+    g = scorer.text_projection.proj.weight.grad
+    assert g is not None, "text_projection.proj.weight has no grad"
+    assert g.abs().sum() > 0
+
+
+def test_text_model_params_no_grad(scorer: PronunciationScorer) -> None:
+    """Frozen text_model params inside text_projection must have no grad."""
+    scorer.train()
+    wav  = torch.randn(2, T_AUDIO)
+    mask = torch.ones(2, T_AUDIO, dtype=torch.long)
+    scorer(wav, mask, ["hi", "bye"]).sum().backward()
+    for p in scorer.text_projection.text_model.parameters():
+        assert p.grad is None, "Frozen text_model param has grad"
+
+
+def test_text_projection_returns_sequence(scorer: PronunciationScorer) -> None:
+    """text_projection.forward must return (seq [B,N,256], mask [B,N])."""
+    feats, mask_out = scorer.text_projection(["hello world", "test"])
+    assert feats.ndim == 3, f"Expected [B,N,proj_dim], got shape {feats.shape}"
+    assert feats.shape[-1] == PROJ_DIM
+    assert mask_out.dtype == torch.bool
+    assert mask_out.shape == (2, feats.shape[1])
+
+
+def test_cross_attn_fusion_attribute(scorer: PronunciationScorer) -> None:
+    """scorer.cross_attn_fusion must exist with self.mha inside."""
+    assert hasattr(scorer, "cross_attn_fusion")
+    assert hasattr(scorer.cross_attn_fusion, "mha")
+
+
+def test_text_encoder_compat_alias(scorer: PronunciationScorer) -> None:
+    """scorer.text_encoder must return the text_projection (compat alias)."""
+    assert scorer.text_encoder is scorer.text_projection
 
 
 def test_batch_size_one(scorer: PronunciationScorer) -> None:
@@ -218,6 +266,5 @@ def test_speech_only_ablation(scorer: PronunciationScorer) -> None:
     full   = scorer(wav, mask, txts, speech_only=False)
     speech = scorer(wav, mask, txts, speech_only=True)
 
-    # They should differ because the text path contributes to cross-attention.
     assert not torch.allclose(full, speech, atol=1e-4), \
         "speech_only and full should produce different scores"
