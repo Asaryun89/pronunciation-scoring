@@ -34,6 +34,8 @@ class TextProjection(nn.Module):
         Returns:
             [B, 1, out_dim]
         """
+        # TODO Upgrade 2: replace single-vector [B,1,256] with
+        # per-token sequence [B,N,256] for phoneme-granular cross-attention.
         return self.norm(self.proj(text_emb)).unsqueeze(1)
 
 

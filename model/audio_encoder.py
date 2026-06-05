@@ -66,7 +66,7 @@ def initialize_layer_weights_from_pretrained(
     with torch.no_grad():
         w = encoder.layer_weights  # [4, N]
         w[3] = existing_weights.clone()     # total: inherit pretrained
-        w[0] = _gaussian_row(0.25)          # accuracy: bias toward H1 (early)
+        w[0] = _gaussian_row(0.50)          # accuracy: H1/H2 boundary, phoneme-discriminative
         w[1] = _gaussian_row(0.65)          # fluency: bias toward H2/H3 boundary
         w[2] = _gaussian_row(0.85)          # prosodic: bias toward H3 (late)
 

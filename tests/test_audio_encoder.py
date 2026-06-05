@@ -3,6 +3,9 @@ Tests for model/audio_encoder.py — AudioEncoder.
 
 Uses a lightweight _FakeBackbone stub to avoid downloading
 HuBERT weights or loading a pre-training checkpoint.
+
+Updated for Upgrade 1: AudioEncoder now returns List[4 × Tensor]
+and layer_weights has shape [4, N].
 """
 
 from __future__ import annotations
@@ -117,34 +120,82 @@ def encoder() -> AudioEncoder:
 # Tests
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_output_shape(encoder: AudioEncoder) -> None:
-    """Output must be [B, T', proj_dim]."""
+def test_output_is_list_of_four(encoder: AudioEncoder) -> None:
+    """AudioEncoder must return a list of 4 tensors, one per scoring dimension."""
     B, T = 4, 8000
     wav  = torch.randn(B, T)
     mask = torch.ones(B, T, dtype=torch.long)
     out  = encoder(wav, mask)
-    assert out.shape[0] == B,   f"Batch dim wrong: {out.shape}"
-    assert out.shape[2] == 256, f"proj_dim wrong: {out.shape}"
+    assert isinstance(out, list), f"Expected list, got {type(out)}"
+    assert len(out) == 4, f"Expected 4 tensors, got {len(out)}"
+
+
+def test_output_shape(encoder: AudioEncoder) -> None:
+    """Each of the 4 output tensors must be [B, T', proj_dim]."""
+    B, T = 4, 8000
+    wav  = torch.randn(B, T)
+    mask = torch.ones(B, T, dtype=torch.long)
+    out  = encoder(wav, mask)
+    for d, x in enumerate(out):
+        assert x.shape[0] == B,   f"dim {d}: batch dim wrong: {x.shape}"
+        assert x.shape[2] == 256, f"dim {d}: proj_dim wrong: {x.shape}"
+
+
+def test_layer_weights_shape(encoder: AudioEncoder) -> None:
+    """layer_weights must have shape [4, N_LAYERS] after Upgrade 1."""
+    assert encoder.layer_weights.shape == (4, N_LAYERS), \
+        f"Expected (4, {N_LAYERS}), got {encoder.layer_weights.shape}"
 
 
 def test_layer_weights_sum_to_one(encoder: AudioEncoder) -> None:
-    """softmax(layer_weights) must sum to 1.0."""
-    import torch
-    w = torch.softmax(encoder.layer_weights, dim=0)
-    assert w.shape == (N_LAYERS,)
-    assert abs(w.sum().item() - 1.0) < 1e-5, f"Weights sum: {w.sum().item()}"
+    """softmax(layer_weights, dim=1) must sum to 1.0 along hidden-state dim."""
+    w = torch.softmax(encoder.layer_weights, dim=1)   # [4, N_LAYERS]
+    assert w.shape == (4, N_LAYERS)
+    row_sums = w.sum(dim=1)                            # [4]
+    for i, s in enumerate(row_sums):
+        assert abs(s.item() - 1.0) < 1e-5, \
+            f"Row {i} sums to {s.item():.6f}, expected 1.0"
+
+
+def test_accuracy_peak_at_midrange(encoder: AudioEncoder) -> None:
+    """After Fix 2, accuracy row peak must be near layer 6 (center_frac=0.50)."""
+    sm   = torch.softmax(encoder.layer_weights[0], dim=0)
+    peak = sm.argmax().item()
+    assert peak >= 4, \
+        f"Accuracy peak at layer {peak}, expected ≥4 for center_frac=0.50"
+
+
+def test_proj_is_modulelist(encoder: AudioEncoder) -> None:
+    """proj must be a ModuleList of 4 independent Linear heads."""
+    assert isinstance(encoder.proj, nn.ModuleList), \
+        f"Expected nn.ModuleList, got {type(encoder.proj)}"
+    assert len(encoder.proj) == 4
 
 
 def test_gradient_flows_to_layer_weights(encoder: AudioEncoder) -> None:
-    """Backward must populate layer_weights.grad."""
+    """Backward must populate all 4 rows of layer_weights.grad."""
     encoder.train()
     B, T = 2, 4000
     wav  = torch.randn(B, T)
     mask = torch.ones(B, T, dtype=torch.long)
-    out  = encoder(wav, mask)
-    out.sum().backward()
+    out  = encoder(wav, mask)                      # List[4 × Tensor]
+    sum(x.sum() for x in out).backward()
     assert encoder.layer_weights.grad is not None, "layer_weights has no grad"
+    assert encoder.layer_weights.grad.shape == (4, N_LAYERS), \
+        f"Wrong grad shape: {encoder.layer_weights.grad.shape}"
     assert encoder.layer_weights.grad.abs().sum() > 0, "layer_weights grad is zero"
+
+
+def test_gradient_flows_to_all_proj_heads(encoder: AudioEncoder) -> None:
+    """Each proj[d].weight must receive a gradient."""
+    encoder.train()
+    wav  = torch.randn(2, 4000)
+    mask = torch.ones(2, 4000, dtype=torch.long)
+    sum(x.sum() for x in encoder(wav, mask)).backward()
+    for d in range(4):
+        g = encoder.proj[d].weight.grad
+        assert g is not None, f"proj[{d}].weight has no grad"
+        assert g.abs().sum() > 0, f"proj[{d}].weight grad is zero"
 
 
 def test_gradient_does_not_flow_into_frozen_extractor(encoder: AudioEncoder) -> None:
@@ -153,11 +204,9 @@ def test_gradient_does_not_flow_into_frozen_extractor(encoder: AudioEncoder) -> 
     B, T = 2, 4000
     wav  = torch.randn(B, T)
     mask = torch.ones(B, T, dtype=torch.long)
-    encoder(wav, mask).sum().backward()
-    for name, p in encoder.backbone.named_parameters():
-        # The _FakeBackbone._trainable is NOT in feature_extractor,
-        # so we just check no unexpected grads in feature_extractor sub-modules.
-        pass   # stub has no real frozen params; structural check passes
+    sum(x.sum() for x in encoder(wav, mask)).backward()
+    # Stub has no real frozen params; structural check passes
+    pass
 
 
 def test_batch_size_one(encoder: AudioEncoder) -> None:
@@ -165,4 +214,6 @@ def test_batch_size_one(encoder: AudioEncoder) -> None:
     wav  = torch.randn(1, 4000)
     mask = torch.ones(1, 4000, dtype=torch.long)
     out  = encoder(wav, mask)
-    assert out.shape[0] == 1
+    assert isinstance(out, list) and len(out) == 4
+    for d, x in enumerate(out):
+        assert x.shape[0] == 1, f"dim {d}: batch dim should be 1, got {x.shape}"

@@ -158,7 +158,7 @@ class PronunciationScorer(nn.Module):
         score_pro = self.scoring_head.prosodic_mlp(pooled_pro)   # [B, 1]
 
         # Order matches SCORE_DIMS = ["total", "accuracy", "fluency", "prosodic"]
-        return torch.cat([score_tot, score_acc, score_flu, score_pro], dim=1)
+        return torch.cat([score_tot, score_acc, score_flu, score_pro], dim=1) * 10
 
     # ──────────────────────────────────────────────────────────────────────
     # Optimizer

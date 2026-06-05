@@ -4,6 +4,10 @@ Tests for model/pronunciation_scorer.py — PronunciationScorer.
 Uses stub AudioEncoder + stub text encoder so no HF model downloads occur.
 The real CrossAttentionFusion, post-fusion transformer, and MLPScoringHead
 are tested end-to-end.
+
+Updated for:
+  - Upgrade 1: AudioEncoder returns List[4 × Tensor]; proj is a ModuleList.
+  - Phase 0 Fix 1: model output is in (0, 10) MOS range (sigmoid × 10).
 """
 
 from __future__ import annotations
@@ -116,7 +120,7 @@ def _make_cfg() -> dict:
             "post_fusion_heads":      4,
             "post_fusion_dropout":    0.0,
             "post_fusion_layers":     2,
-            "n_scores":               5,
+            "n_scores":               4,
             "scoring_dropout":        0.0,
         },
         "training": {
@@ -143,26 +147,26 @@ def scorer() -> PronunciationScorer:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_output_shape(scorer: PronunciationScorer) -> None:
-    """Full forward pass must produce [B, 5]."""
+    """Full forward pass must produce [B, 4] — 4 scoring dimensions."""
     wav  = torch.randn(B, T_AUDIO)
     mask = torch.ones(B, T_AUDIO, dtype=torch.long)
     txts = ["hello"] * B
     out  = scorer(wav, mask, txts)
-    assert out.shape == (B, 5), f"Expected ({B}, 5), got {tuple(out.shape)}"
+    assert out.shape == (B, 4), f"Expected ({B}, 4), got {tuple(out.shape)}"
 
 
-def test_all_outputs_in_0_1(scorer: PronunciationScorer) -> None:
-    """Scores must be in [0, 1] (sigmoid output, before ×10 display)."""
+def test_all_outputs_in_mos_range(scorer: PronunciationScorer) -> None:
+    """Scores must be in (0, 10) MOS range (sigmoid × 10, Fix 1)."""
     wav  = torch.randn(B, T_AUDIO)
     mask = torch.ones(B, T_AUDIO, dtype=torch.long)
     txts = ["THE CAT SAT ON THE MAT"] * B
     out  = scorer(wav, mask, txts)
-    assert out.min().item() >= 0.0, f"Score below 0: {out.min()}"
-    assert out.max().item() <= 1.0, f"Score above 1: {out.max()}"
+    assert out.min().item() > 0.0,  f"Score at or below 0: {out.min():.4f}"
+    assert out.max().item() < 10.0, f"Score at or above 10: {out.max():.4f}"
 
 
-def test_sigmoid_scaling_bounded() -> None:
-    """Stress test: large random inputs must still produce [0, 1] scores."""
+def test_mos_scaling_bounded() -> None:
+    """Stress test: large random inputs must still produce scores in (0, 10)."""
     cfg = _make_cfg()
     with patch("model.audio_encoder.MultiResHuBERT", _FakeBackbone), \
          patch("model.pronunciation_scorer.Qwen3MeanPoolEncoder", _FakeTextEncoder):
@@ -171,20 +175,21 @@ def test_sigmoid_scaling_bounded() -> None:
         wav  = torch.randn(2, T_AUDIO) * 10.0
         mask = torch.ones(2, T_AUDIO, dtype=torch.long)
         out  = model(wav, mask, ["x", "y"])
-        assert out.min().item() >= 0.0
-        assert out.max().item() <= 1.0
+        assert out.min().item() > 0.0
+        assert out.max().item() < 10.0
 
 
 def test_gradient_flows_to_audio_proj(scorer: PronunciationScorer) -> None:
-    """Backward must reach audio_encoder.proj.weight."""
+    """Backward must reach audio_encoder.proj[0].weight (ModuleList after Upgrade 1)."""
     scorer.train()
     wav  = torch.randn(2, T_AUDIO)
     mask = torch.ones(2, T_AUDIO, dtype=torch.long)
     out  = scorer(wav, mask, ["hi", "bye"])
     out.sum().backward()
-    assert scorer.audio_encoder.proj.weight.grad is not None, \
-        "audio_encoder.proj.weight has no grad"
-    assert scorer.audio_encoder.proj.weight.grad.abs().sum() > 0
+    for d in range(4):
+        g = scorer.audio_encoder.proj[d].weight.grad
+        assert g is not None, f"audio_encoder.proj[{d}].weight has no grad"
+        assert g.abs().sum() > 0, f"audio_encoder.proj[{d}].weight grad is zero"
 
 
 def test_text_encoder_params_no_grad(scorer: PronunciationScorer) -> None:
@@ -201,7 +206,7 @@ def test_batch_size_one(scorer: PronunciationScorer) -> None:
     wav  = torch.randn(1, T_AUDIO)
     mask = torch.ones(1, T_AUDIO, dtype=torch.long)
     out  = scorer(wav, mask, ["single"])
-    assert out.shape == (1, 5)
+    assert out.shape == (1, 4)
 
 
 def test_speech_only_ablation(scorer: PronunciationScorer) -> None:
