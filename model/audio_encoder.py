@@ -307,4 +307,10 @@ class AudioEncoder(nn.Module):
             x = self.pre_transformer(x, src_key_padding_mask=pad_mask)
             pre_fused.append(x)
 
+        # Expose pre-projection H1 features for the phoneme head in
+        # PronunciationScorer.  Side-channel: set on the module so the
+        # scorer can access it without changing the return type.
+        self.last_dim_feats = dim_feats   # [4, B, T', h_dim] — detached copy not needed;
+                                          # scorer controls detach via current_epoch
+
         return pre_fused   # 4 × [B, T', proj_dim]

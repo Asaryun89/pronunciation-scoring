@@ -89,6 +89,15 @@ class PronunciationScorer(nn.Module):
         # ── Scoring head ────────────────────────────────────────────────────
         self.scoring_head = MLPScoringHead(cfg)
 
+        # ── Auxiliary phoneme head (Phase 4) ────────────────────────────────
+        # Operates on H1 high-res 768-dim features (accuracy dim, row 0).
+        # Detached from backbone after epoch 2 to prevent aux CE from
+        # distorting main regression gradients.
+        # TODO Sub-path A: replace pseudo-labels with MFA TextGrid labels
+        #      once data/mfa/ alignments are verified (see data/phoneme_labels.py).
+        self.num_phonemes  = mcfg.get("num_phonemes", 40)
+        self.phoneme_head  = nn.Linear(mcfg["speech_hidden_dim"], self.num_phonemes)
+
         # Cache LRs for get_optimizer.
         self._lr_speech = tcfg["lr_speech_encoder"]
         self._lr_proj   = tcfg["lr_audio_proj"]
@@ -114,6 +123,7 @@ class PronunciationScorer(nn.Module):
         attention_mask: Tensor,       # [B, T_audio]  1=real 0=pad
         transcripts:    List[str],    # length B
         speech_only:    bool = False, # ablation: zero out text contribution
+        current_epoch:  int  = 0,     # for phoneme head detach schedule
     ) -> Tensor:
         """
         Args:
@@ -172,8 +182,17 @@ class PronunciationScorer(nn.Module):
         pooled_flu = _masked_mean(pre_fused[1])
         pooled_pro = _masked_mean(pre_fused[2])
 
-        # TODO Upgrade 3 aux: add phoneme head when frame labels available
-        # phoneme_logits = None; phoneme_labels = None
+        # ── Auxiliary phoneme head (Phase 4) ────────────────────────────────
+        # H1 high-res features (accuracy dim, row 0) at backbone resolution.
+        # AudioEncoder.forward sets last_dim_feats = [4, B, T', h_dim].
+        h1_feats = self.audio_encoder.last_dim_feats[0]   # [B, T', h_dim]
+        if self.training and current_epoch > 2:
+            # Detach after epoch 2: prevents aux CE from corrupting
+            # the main regression gradients once backbone is warm.
+            h1_feats = h1_feats.detach()
+        ph_logits = self.phoneme_head(h1_feats)            # [B, T', num_phonemes]
+        self.last_phoneme_logits = ph_logits.view(-1, self.num_phonemes)
+        # [B*T', num_phonemes] — consumed by PronunciationScoringLoss
 
         # ── Per-dimension scoring ────────────────────────────────────────────
         score_tot = self.scoring_head.total_mlp(pooled_tot)
@@ -213,13 +232,14 @@ class PronunciationScorer(nn.Module):
         # Group C: frozen Qwen3 LM backbone (lr=0 keeps optimizer state intact)
         text_params = list(self.text_projection.text_model.parameters())
 
-        # Group D: trainable text proj head + fusion + scoring
+        # Group D: trainable text proj head + fusion + scoring + phoneme aux
         fusion_params = (
             list(self.text_projection.proj.parameters())
             + list(self.text_projection.norm.parameters())
             + list(self.cross_attn_fusion.parameters())
             + list(self.post_fusion.parameters())
             + list(self.scoring_head.parameters())
+            + list(self.phoneme_head.parameters())
         )
 
         log.info(
