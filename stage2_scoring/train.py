@@ -26,16 +26,16 @@ except Exception:
     Accelerator = None
 
 # ---------------------------------------------------------------------------
-# Path fix — support both `python models/train.py` and `python -m models.train`
+# Path fix — support both `python stage2_scoring/train.py` and `python -m stage2_scoring.train`
 # ---------------------------------------------------------------------------
 _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _root not in sys.path:
     sys.path.insert(0, _root)
 
-from models.constants import SENT_DIMS, PROSODY_DIMS, ACTIVE_SENT_IDXS  # noqa: E402
-from models.hubert_multitask import HubertMultiTask                             # noqa: E402
-from data.collate import Collator                                                # noqa: E402
-from data.validate import validate_example_schema                               # noqa: E402
+from stage2_scoring.constants import SENT_DIMS, PROSODY_DIMS, ACTIVE_SENT_IDXS  # noqa: E402
+from stage2_scoring.hubert_multitask import HubertMultiTask                             # noqa: E402
+from stage2_scoring.collate import Collator                                                # noqa: E402
+from stage2_scoring.validate import validate_example_schema                               # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -185,10 +185,17 @@ def main():
     ap.add_argument("--dataset",     type=str,   default="mispeech/speechocean762")
     ap.add_argument("--train_split", type=str,   default="train")
     ap.add_argument("--valid_split", type=str,   default="test")
-    ap.add_argument("--model",       type=str,   default="facebook/hubert-base-ls960")
-    ap.add_argument("--out_dir",     type=str,   default="ckpt_hubert_multitask")
-    ap.add_argument("--epochs",      type=int,   default=5)
-    ap.add_argument("--batch_size",  type=int,   default=4)
+    ap.add_argument("--backbone",    type=str,   default="hubert-large",
+                    choices=["hubert-large", "stage1"],
+                    help="HuBERT weight source: 'hubert-large' = facebook/hubert-large-ll60k, "
+                         "'stage1' = CTC fine-tuned encoder from stage 1 (see --stage1_dir)")
+    ap.add_argument("--stage1_dir",  type=str,   default="outputs/hubert-large-speechocean-ctc",
+                    help="Path to the stage-1 CTC output directory (used with --backbone stage1)")
+    ap.add_argument("--model",       type=str,   default=None,
+                    help="Explicit HuBERT checkpoint (HF hub id or local path); overrides --backbone")
+    ap.add_argument("--out_dir",     type=str,   default="outputs/ckpt_hubert_multitask")
+    ap.add_argument("--epochs",      type=int,   default=100)
+    ap.add_argument("--batch_size",  type=int,   default=8)
     ap.add_argument("--lr",          type=float, default=2e-5)
     ap.add_argument("--wd",          type=float, default=0.01)
     ap.add_argument("--dropout",     type=float, default=0.1)
@@ -205,15 +212,16 @@ def main():
     ap.add_argument("--mlp_hidden_layers",      type=int, default=2,
                     help="Hidden FC→ReLU→Dropout blocks in the MLP scoring head")
     ap.add_argument("--num_unfreeze_hubert_layers", type=int, default=12,
-                    help="Unfreeze top-N HuBERT transformer layers (12 = full backbone, 0 = all frozen)")
-    ap.add_argument("--num_workers", type=int,   default=2)
+                    help="Unfreeze top-N HuBERT transformer layers (0 = all frozen; "
+                         "HuBERT-Large has 24, so the default trains the top half)")
+    ap.add_argument("--num_workers", type=int,   default=4)
     ap.add_argument("--seed",        type=int,   default=42)
     ap.add_argument("--w_sent",      type=float, default=1.0)
     ap.add_argument("--w_pfeat",     type=float, default=0.0,
                     help="Weight for auxiliary prosody feature loss (0 = disabled)")
     ap.add_argument("--warmup_steps", type=int,   default=100,
                     help="Linear LR warmup steps (0 = disabled)")
-    ap.add_argument("--patience",    type=int,   default=3,
+    ap.add_argument("--patience",    type=int,   default=20,
                     help="Early stopping patience on pearson_total (0 = disabled)")
     ap.add_argument("--log_every",   type=int,   default=50)
     ap.add_argument("--text_model", type=str,   default="Qwen/Qwen3-Embedding-0.6B",
@@ -221,6 +229,22 @@ def main():
     ap.add_argument("--no_freeze_text",  action="store_true",
                     help="Fine-tune the text encoder instead of keeping it frozen")
     args = ap.parse_args()
+
+    # ---- Resolve backbone weights ----
+    # Stage-1 output is a HubertForCTC checkpoint; HubertModel.from_pretrained()
+    # loads its encoder weights and discards the CTC lm_head (warning is expected).
+    if args.model:
+        backbone_path = args.model
+    elif args.backbone == "stage1":
+        backbone_path = args.stage1_dir
+        if not os.path.isdir(backbone_path):
+            sys.exit(
+                f"--backbone stage1: directory '{backbone_path}' not found. "
+                f"Run stage1_ctc/train.py first or point --stage1_dir at the checkpoint."
+            )
+    else:
+        backbone_path = "facebook/hubert-large-ll60k"
+    print(f"Backbone weights: {backbone_path}")
 
     set_seed(args.seed)
     accelerator = create_accelerator()
@@ -262,7 +286,7 @@ def main():
 
     # ---- Model + optimiser ----
     model = HubertMultiTask(
-        model_name=args.model,
+        model_name=backbone_path,
         d_model=args.d_model,
         num_heads=args.num_heads,
         num_audio_transformer_layers=args.num_audio_transformer_layers,

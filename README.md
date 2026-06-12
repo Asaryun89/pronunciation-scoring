@@ -1,121 +1,121 @@
-# English Pronunciation Scoring
+# Pronunciation Scoring Pipeline
 
-End-to-end pronunciation scoring pipeline trained on [SpeechOcean762](https://huggingface.co/datasets/mispeech/speechocean762).
-Combines a layer-weighted HuBERT encoder, a frozen Qwen3 text encoder, cross-attention fusion, and a deep MLP scoring head to predict five utterance-level pronunciation dimensions.
+A two-stage pipeline for automatic pronunciation scoring using HuBERT.
 
-## Architecture
-
-![Model Architecture](docs/model_architect.png)
+## Pipeline Overview
 
 ```
-Raw audio (any SR)
-  └─ preprocess_wav()  →  resample 16 kHz · VAD trim · zero-mean/unit-std
-       │
-       ▼  Audio path
-  HuBERT (facebook/hubert-base-ls960)
-    13 hidden states  →  learnable layer-weighted sum  →  (T, 768)
-    Linear(768, 256)                                   →  (T, 256)
-    TransformerEncoder ×1  (pre-LN, pre-fusion)        →  (T, 256)
-       │
-       │  Text path (parallel)
-       │  Faster-Whisper ASR  →  transcript
-       │  Qwen3-Embedding-0.6B  →  mask-aware mean pool  →  (1024,)
-       │  Linear(1024, 256) + LayerNorm                  →  (1, 256)  [K/V]
-       │
-       ▼
-  CrossAttentionFusion  (Audio Q · Text K/V)           →  (T, 256)
-  TransformerEncoder ×2  (pre-LN, post-fusion)         →  (T, 256)
-  mean(dim=1)                                          →  (256,)
-       │
-       ├─ MLPScoringHead  →  Sigmoid × 5  →  [0,1]  →  ×10  →  [0,10]
+Stage 1 — CTC Pretext Task                     (stage1_ctc/)
+  HuBERT-Large (LibriSpeech pretrained)
+       ↓  fine-tune with CTC on SpeechOcean762 transcripts
+  outputs/hubert-large-speechocean-ctc/
+
+Stage 2 — Multitask Scoring Model              (stage2_scoring/)
+  HuBERT-Large encoder (stage-1 weights or stock hubert-large-ll60k)
+       ↓  layer-weighted sum + projection
+  Cross-attention fusion with reference-text embedding (Qwen3-Embedding)
+       ↓  Transformer refinement → mean pool → MLP head
+  Utterance scores: total, accuracy, fluency, prosodic, completeness
 ```
 
-**Output dimensions** (SpeechOcean scale 0–10):
+## Repository Structure
 
-| Dimension | Description |
-|-----------|-------------|
-| `total` | Overall pronunciation quality |
-| `accuracy` | Phonetic accuracy |
-| `fluency` | Speech fluency and naturalness |
-| `prosodic` | Prosody, rhythm, and stress |
+```
+pronunciation-scoring/
+├── stage1_ctc/            # Stage 1 — HuBERT CTC fine-tuning
+│   ├── train.py           # Entry point: python -m stage1_ctc.train
+│   ├── config.py          # Model name, dataset, paths, training hyperparameters
+│   ├── processor.py       # Text normalisation, vocab building, Wav2Vec2Processor
+│   ├── data.py            # Dataset loading (SpeechOcean762) and preprocessing
+│   ├── collator.py        # DataCollatorCTCWithPadding
+│   ├── metrics.py         # WER metric factory for HuggingFace Trainer
+│   └── model.py           # HuBERT-CTC model builder (frozen CNN encoder)
+├── stage2_scoring/        # Stage 2 — utterance-level scoring model
+│   ├── train.py           # Entry point: python -m stage2_scoring.train
+│   ├── hubert_multitask.py# HubertMultiTask model (training + inference forward)
+│   ├── scoring_heads.py   # CrossAttentionFusion, MLPScoringHead
+│   ├── constants.py       # Score dims/scales shared with inference
+│   ├── collate.py         # Batch collator (audio decode, VAD, prosody targets)
+│   └── validate.py        # SpeechOcean762 schema validation
+├── utils/                 # Shared audio helpers (preprocessing, prosody, alignment)
+├── notebooks/
+│   └── architecture.ipynb # Visual walkthrough of both stages (diagrams + live introspection)
+├── outputs/               # All generated artifacts (gitignored)
+│   ├── vocab.json                       # Stage-1 character vocabulary
+│   ├── hubert-large-speechocean-ctc/    # Stage-1 model + checkpoints
+│   └── ckpt_hubert_multitask/           # Stage-2 checkpoints + result.csv
+├── transfer.sh            # rsync helper: sync code/checkpoints with a GPU server
+└── requirements.txt
+```
 
-## Results
+**Dataset:** [mispeech/speechocean762](https://huggingface.co/datasets/mispeech/speechocean762)
+— 5,000 English utterances with human pronunciation scores at phoneme, word, and utterance level.
 
-Trained on `mispeech/speechocean762` train split, evaluated on test split.
-Best checkpoint at epoch 10 (selected by `pearson_total`).
-
-### Utterance-level Pearson correlation (PCC ↑) on SpeechOcean762
-
-| Model | total | accuracy | fluency | prosodic |
-|-------|------:|--------:|--------:|--------:|
-| HuBERT Base + BLSTM *(Kim et al., 2022)* | — | — | 0.74 | 0.73 |
-| **HuBERT Large + BLSTM** *(Kim et al., 2022)* | — | — | **0.78** | **0.77** |
-| HierTFR *(Yan et al., ACL 2024)* | 0.764 | 0.735 | 0.801 | 0.795 |
-| **Ours** (HuBERT-base + Qwen3 + CrossAttn) | 0.740 | 0.714 | 0.792 | 0.791 |
-
-> Kim et al. (2022) report only fluency and prosodic for SpeechOcean762.
-> HierTFR uses HuBERT Large + a hierarchical Transformer trained with phone/word/utterance supervision.
-> Our model uses HuBERT Base (smaller backbone) with a single utterance-level MLP head and no phone-level labels.
-
-### Full metrics (this work)
-
-| Metric | total | accuracy | fluency | prosodic |
-|--------|------:|--------:|--------:|--------:|
-| Pearson r | 0.740 | 0.714 | 0.792 | 0.791 |
-| Spearman ρ | 0.745 | 0.705 | 0.796 | 0.795 |
-| MAE (÷10) | 0.079 | 0.084 | 0.068 | 0.068 |
-
-> `completeness` is excluded from training loss — SpeechOcean learners score 10/10 almost universally, which collapses the head to a constant predictor.
-
-![Validation Metrics](docs/metrics.png)
-
-![Training Loss](docs/loss.png)
-
-### Model statistics
-
-![Model Statistics](docs/models_statistics.png)
-
-![Model Info](docs/models_info.png)
-
-## Quick Start
-
-### Training
+## Setup
 
 ```bash
-python models/train.py \
-  --dataset mispeech/speechocean762 \
-  --epochs 100 \
-  --batch_size 4 \
-  --lr 2e-5 \
-  --out_dir ckpt_hubert_multitask
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+pip install jiwer librosa   # stage 1 extras (WER metric, audio)
 ```
 
-Key training arguments:
+## Stage 1 — HuBERT CTC Fine-tuning
 
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--epochs` | 5 | Number of training epochs |
-| `--batch_size` | 4 | Batch size |
-| `--lr` | 2e-5 | AdamW learning rate |
-| `--d_model` | 256 | Shared projection dimension |
-| `--num_heads` | 8 | Attention heads |
-| `--num_audio_transformer_layers` | 1 | Pre-fusion self-attention depth |
-| `--num_transformer_layers` | 2 | Post-fusion Transformer depth |
-| `--mlp_hidden_layers` | 2 | MLP hidden blocks |
-| `--num_unfreeze_hubert_layers` | 12 | HuBERT backbone layers to unfreeze (12 = full) |
-| `--w_pfeat` | 0.0 | Auxiliary prosody loss weight (0 = disabled) |
-| `--patience` | 3 | Early stopping on `pearson_total` |
-| `--text_model` | `Qwen/Qwen3-Embedding-0.6B` | Text encoder (empty string to disable) |
-| `--no_freeze_text` | — | Fine-tune text encoder (frozen by default) |
+**Goal:** Fine-tune HuBERT-Large on SpeechOcean762 transcripts using CTC loss.
+The learned representations are then transferred to pronunciation scoring heads.
 
-Best checkpoint is saved to `{out_dir}/best.pt` (selected by `pearson_total`).
-Training metrics are logged to `{out_dir}/result.csv`.
+**Base model:** `facebook/hubert-large-ls960-ft` (HuBERT-Large, LibriSpeech 960h)
 
-### CLI Inference
+**Key design choices:**
+- CNN feature encoder is frozen; only transformer layers are fine-tuned.
+- Gradient checkpointing enabled to reduce VRAM usage (~20% speed cost).
+- Best checkpoint selected by lowest validation WER.
 
 ```bash
-python -m inference.infer \
-  --wav data/learner/01_learner.wav \
-  --checkpoint ckpt_hubert_multitask/best.pt \
-  --lang en
+python -m stage1_ctc.train
 ```
+
+Outputs are saved to `outputs/hubert-large-speechocean-ctc/`:
+- model weights and processor
+- `test_results.json` with final WER on the held-out test set
+
+All hyperparameters live in `stage1_ctc/config.py`.
+
+## Stage 2 — Utterance Scoring
+
+**Goal:** Train `HubertMultiTask` to predict the five SpeechOcean762
+utterance scores (completeness is excluded from the loss — see
+`stage2_scoring/constants.py`).
+
+```bash
+# Backbone from stage 1 (CTC fine-tuned HuBERT-Large):
+python -m stage2_scoring.train --backbone stage1
+
+# Or the stock pretrained HuBERT-Large:
+python -m stage2_scoring.train --backbone hubert-large
+
+# Any other checkpoint:
+python -m stage2_scoring.train --model <hub-id-or-path>
+```
+
+Checkpoints (`best.pt`, selected by Pearson correlation on `total`) and
+`result.csv` metrics are written to `outputs/ckpt_hubert_multitask/`.
+See `python -m stage2_scoring.train --help` for all options
+(text stream, layer unfreezing, prosody auxiliary loss, ...).
+
+## Syncing with a GPU server
+
+```bash
+./transfer.sh push-code          # upload source code
+./transfer.sh pull-checkpoints   # download outputs/ (models, results)
+```
+
+## TODO / Planned Work
+
+- SSL masking strategies for phoneme prediction:
+  - Replace phonemes with a mask token
+  - Zero 1-dimensional features
+  - Zero multi-dimensional prosodic features
+- Word- and phoneme-level score heads
+- Vowel/consonant classification auxiliary task
+- Articulation trait prediction

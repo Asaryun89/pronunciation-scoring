@@ -47,7 +47,7 @@ _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _root not in sys.path:
     sys.path.insert(0, _root)
 
-from models.scoring_heads import CrossAttentionFusion, MLPScoringHead  # noqa: E402
+from stage2_scoring.scoring_heads import CrossAttentionFusion, MLPScoringHead  # noqa: E402
 from utils.alignment import build_word_segments                         # noqa: E402
 
 
@@ -73,7 +73,7 @@ class HubertMultiTask(nn.Module):
 
     def __init__(
         self,
-        model_name:                   str           = "facebook/hubert-base-ls960",
+        model_name:                   str           = "facebook/hubert-large-ll60k",
         d_model:                      int           = 256,
         num_heads:                    int           = 8,
         num_audio_transformer_layers: int           = 1,
@@ -104,7 +104,7 @@ class HubertMultiTask(nn.Module):
                     for p in layer.parameters():
                         p.requires_grad = True
 
-        H        = self.hubert.config.hidden_size       # 768 for hubert-base
+        H        = self.hubert.config.hidden_size       # 1024 for hubert-large
         n_layers = self.hubert.config.num_hidden_layers + 1  # transformer layers + embedding layer
 
         # Learnable scalar weights for the layer-weighted sum.

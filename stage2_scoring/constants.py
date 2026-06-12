@@ -1,4 +1,4 @@
-# Shared constants between training (models/train.py) and inference (inference/predictor.py).
+# Shared constants between training (stage2_scoring/train.py) and inference (inference/predictor.py).
 # Any change here must be reflected in both pipelines.
 
 # Output dimension order for the sentence head
@@ -15,5 +15,5 @@ PROSODY_DIMS = ["rms", "zcr", "peak_rate", "f0_mean", "f0_std"]
 # because SpeechOcean learners almost always score 10/10, causing constant predictions
 ACTIVE_SENT_IDXS = [0, 1, 2, 3]   # total, accuracy, fluency, prosodic
 
-# Approximate HuBERT-base frame rate for precomputing word span indices
+# Approximate HuBERT frame rate (same for base and large) for precomputing word span indices
 HUBERT_FRAME_HZ = 50.0

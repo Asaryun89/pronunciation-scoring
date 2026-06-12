@@ -2,10 +2,13 @@ numpy
 scipy
 torch
 torchaudio
-transformers
+transformers>=4.51  # Qwen3-Embedding support
+datasets            # training: load SpeechOcean762
+accelerate          # training: multi-GPU/mixed precision (single-process fallback exists)
 soundfile
-webrtcvad
+webrtcvad           # no Windows wheel — on Windows use: pip install webrtcvad-wheels
 faster-whisper
 fastapi
 uvicorn
 pydantic
+pyworld             # optional: F0 prosody features (code falls back to zeros if absent)

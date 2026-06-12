@@ -13,7 +13,18 @@
       "Bash(mkdir -p d:/pronunciation_scoring/notebook)",
       "Bash(mv d:/pronunciation_scoring/run_inference.ipynb d:/pronunciation_scoring/notebook/)",
       "Bash(mv d:/pronunciation_scoring/stage_output_inspection.ipynb d:/pronunciation_scoring/notebook/)",
-      "Bash(mv d:/pronunciation_scoring/training_analysis.ipynb d:/pronunciation_scoring/notebook/)"
+      "Bash(mv d:/pronunciation_scoring/training_analysis.ipynb d:/pronunciation_scoring/notebook/)",
+      "PowerShell(python -c \"import datasets, accelerate\" 2>$null)",
+      "PowerShell(python -c \"import importlib.util; print\\('datasets:', importlib.util.find_spec\\('datasets'\\) is not None\\); print\\('accelerate:', importlib.util.find_spec\\('accelerate'\\) is not None\\); print\\('pyworld:', importlib.util.find_spec\\('pyworld'\\) is not None\\)\")",
+      "PowerShell(python -c \"import importlib.util as u; print\\({m: u.find_spec\\(m\\) is not None for m in ['torch','soundfile','webrtcvad','numpy','scipy','transformers']}\\)\")",
+      "PowerShell(pip install soundfile webrtcvad 2>&1)",
+      "PowerShell(pip install soundfile webrtcvad-wheels 2>&1)",
+      "PowerShell(python -c \"import soundfile, webrtcvad; print\\('imports OK'\\)\")",
+      "PowerShell(python _collator_smoke_test.py)",
+      "PowerShell(pip install datasets accelerate 2>&1)",
+      "PowerShell(python -c \"import models.train; print\\('models.train imports cleanly - Collator:', models.train.Collator.__module__, '| validator:', models.train.validate_example_schema.__module__\\)\")",
+      "Bash(bash -n sync_to_server.sh)",
+      "Bash(bash sync_to_server.sh --dry-run)"
     ]
   }
 }

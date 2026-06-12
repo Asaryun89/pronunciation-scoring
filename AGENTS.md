@@ -1,328 +1,168 @@
-# AGENTS.md
+# AGENTS.md — Reproducibility Guide
 
-## Project: Pronunciation Scoring (Inference-First)
+This document tells AI agents (and humans) everything needed to understand,
+run, and extend this repository without additional context.
 
-This repository currently implements an **inference-oriented pronunciation scoring pipeline** using:
+---
 
-- `HuBERT` embeddings (`facebook/hubert-base-ls960`)
-- `Faster-Whisper` word timestamp alignment
-- lightweight pooling/prosody feature extraction
-- a multi-head MLP scorer and score fusion
+## Project Purpose
 
-The primary entrypoints are under `inference/`.
+Automatic pronunciation scoring using HuBERT, in two stages:
 
-## Current Architecture (As Implemented)
+- **Stage 1** (`stage1_ctc/`) fine-tunes HuBERT-Large with CTC on
+  SpeechOcean762 transcripts (text-prediction pretext task).
+- **Stage 2** (`stage2_scoring/`) trains `HubertMultiTask` — the (optionally
+  stage-1-initialised) HuBERT encoder fused with a reference-text embedding —
+  to predict utterance-level pronunciation scores.
 
-### 1) Audio Preprocessing (`utils/preprocessing.py`)
+---
 
-Pipeline:
+## Environment
 
-1. Read wav with `soundfile`
-2. Convert to mono
-3. Resample with `scipy.signal.resample_poly` to 16 kHz
-4. Peak normalize
-5. Optional VAD trim with `webrtcvad`
-6. Peak normalize again
+- Python 3.9+
+- CUDA GPU strongly recommended (tested on CUDA 11.8+)
+- Install deps: `pip install -r requirements.txt` plus `jiwer librosa` for Stage 1
 
-Key function:
-
-- `preprocess_wav(path, target_sr=16000, use_vad=True)`
-
-### 2) Speech Representation (`models/hubert_encoder.py`)
-
-- Uses `Wav2Vec2FeatureExtractor` + `HubertModel`
-- Default model: `facebook/hubert-base-ls960`
-- Returns frame-level embeddings `(T, D)` and estimated `frame_hz`
-
-Key classes:
-
-- `HubertConfig`
-- `HubertEncoder.encode(audio, sr)`
-
-### 3) Timestamp Alignment (`models/asr_aligner.py`)
-
-- Uses `faster-whisper` (`WhisperModel`) for transcript + word timestamps
-- `word_timestamps=True`
-- Returns dictionary with:
-  - `text`
-  - `words` (word/start/end/prob)
-  - `language`
-  - `duration`
-
-Key classes:
-
-- `ASRConfig`
-- `ASRAligner.transcribe_with_timestamps(...)`
-
-### 4) Frame-to-Word Mapping (`utils/alignment.py`)
-
-- Converts timestamp seconds to frame indices using `frame_hz`
-- Builds valid `[i0, i1)` frame spans per word
-
-Key function:
-
-- `build_word_segments(word_ts, frame_hz, T)`
-
-### 5) Pooling (`utils/pooling.py`)
-
-- `mean_pool(emb, i0, i1)` for segment vectors
-- `utt_pool_mean_std(emb)` for utterance vector (`2D` dimension)
-
-### 6) Prosody Features (`utils/prosody.py`)
-
-Extracted features:
-
-- `rms`
-- `zcr`
-- `peak_rate`
-- `f0_mean` and `f0_std` (if `pyworld` available, else 0)
-
-Key functions:
-
-- `basic_prosody_features(audio, sr)`
-- `prosody_to_vector(feats)`
-
-### 7) Scoring Heads (`models/scoring_heads.py`)
-
-`MultiHeadScorer` contains:
-
-- `word_head`: outputs `[0,1]` via sigmoid
-- `sentence_head`: outputs `[0,100]` for `completeness`, `fluency`, `prosodic`, and `total`
-
-### 8) Final Score Fusion (`utils/fusion.py`)
-
-Fused score in `[0,100]`:
-
-`final = alpha * (mean_word*100) + beta * utt_score + gamma * (prosody*100)`
-
-Default weights:
-
-- `alpha=0.6`
-- `beta=0.25`
-- `gamma=0.15`
-
-## Inference Flow
-
-Implemented in `inference/predictor.py` using the unified `HubertMultiTask` model:
-
-1. Preprocess wav (resample → VAD → normalize)
-2. Wav2Vec2FeatureExtractor → `input_values` tensor
-3. Faster-Whisper → word timestamps
-4. `HubertMultiTask.forward_inference()`:
-   - HuBERT hidden states `(1, T, 768)`
-   - Estimate `frame_hz = T / duration`
-   - ASR-aligned frame spans via `build_word_segments()`
-   - Sentence: mean pool → `sentence_head` → sigmoid → `[0,1]`
-   - Words: per-span mean pool → `word_head` → sigmoid → `[0,1]`
-5. Scale all scores `× 10` → `[0, 10]` (SpeechOcean native scale)
-6. Extract prosody features (audio-computed, stored in metadata)
-7. Return dataset-shaped structured JSON
-
-Output keys:
-
-- `accuracy`, `completeness`, `fluency`, `prosodic`, `total` — utterance scores `[0, 10]`
-- `text` — ASR transcript
-- `words` — per-word: `text`, `accuracy`, `total`, `start`, `end`, `asr_prob`
-- `audio` — `path`
-- `inference_metadata` — `language`, `duration`, `frame_hz`, `prosody_features`, `scoring_validity`
-
-## Scoring Validity
-
-`inference_metadata.scoring_validity` reflects the checkpoint state:
-
-- `"untrained_random_init"` — no checkpoint loaded; scores are meaningless
-- `"trained:<path>"` — loaded from a trained checkpoint; scores are meaningful
-
-Load a checkpoint via `PredictorConfig(checkpoint_path="ckpt_hubert_multitask/best.pt")`.
-
-## Unified Model Architecture (`models/train.py` → `HubertMultiTask`)
-
-All four heads predict `[0, 1]` via sigmoid. Multiply by scale to display:
-
-| Head | Output | Scale | Trained on |
-|---|---|---|---|
-| `sentence_head` | 5 scalars | ×10 | `total, accuracy, fluency, prosodic, completeness` |
-| `prosody_feat_head` | 5 scalars | raw | `rms, zcr, peak_rate, f0_mean, f0_std` |
-| `word_head` | 1 per word | ×10 | `words[].total` |
-| `phone_head` | 1 per phone | ×2 | `words[].phones-accuracy` |
-
-Score dimension order constant: `SENT_DIMS = ["total", "accuracy", "fluency", "prosodic", "completeness"]`
-
-Word segmentation: even frame splits during training; ASR-aligned spans at inference.
+---
 
 ## Repository Layout
 
-- `models/train.py` — `HubertMultiTask` (unified train+inference model), `Collator`, `compute_loss`, `eval_epoch`, `main()`
-- `models/asr_aligner.py` — Faster-Whisper word timestamps
-- `models/hubert_encoder.py` — standalone HuBERT encoder (retained for compatibility)
-- `models/scoring_heads.py` — `MultiHeadScorer` (superseded by `HubertMultiTask`; retained for reference)
-- `utils/` — preprocessing, alignment, pooling, prosody, fusion
-- `inference/` — `predictor.py`, `infer.py` (CLI), `api.py` (FastAPI)
-- `audio/` — sample wav files
-- `config/` — currently empty
+| Path | Purpose |
+|---|---|
+| `stage1_ctc/train.py` | Stage 1 entry point (`python -m stage1_ctc.train`) |
+| `stage1_ctc/config.py` | All Stage 1 hyperparameters and path constants |
+| `stage1_ctc/processor.py` | Text normalisation, vocab file creation, `Wav2Vec2Processor` |
+| `stage1_ctc/data.py` | Dataset download, train/val split, per-sample preprocessing |
+| `stage1_ctc/collator.py` | Batching with independent CTC padding for inputs and labels |
+| `stage1_ctc/metrics.py` | WER metric factory passed to `Trainer` |
+| `stage1_ctc/model.py` | `HubertForCTC` loader with frozen CNN encoder |
+| `stage2_scoring/train.py` | Stage 2 entry point (`python -m stage2_scoring.train`) |
+| `stage2_scoring/hubert_multitask.py` | `HubertMultiTask` model (training + inference forward) |
+| `stage2_scoring/scoring_heads.py` | `CrossAttentionFusion`, `MLPScoringHead` building blocks |
+| `stage2_scoring/constants.py` | Score dims/scales shared between training and inference |
+| `stage2_scoring/collate.py` | Batch collator: audio decode → VAD trim → prosody targets |
+| `stage2_scoring/validate.py` | SpeechOcean762 schema validation (run on a sample pre-training) |
+| `utils/` | Shared audio helpers: preprocessing, prosody features, alignment |
+| `notebooks/architecture.ipynb` | Visual architecture walkthrough of both stages (diagrams + live model introspection) |
+| `outputs/` | All generated artifacts: vocab, checkpoints, results (gitignored) |
+| `transfer.sh` | rsync helper to sync code/checkpoints with a remote GPU server |
 
-## Run Commands
+---
 
-Training on SpeechOcean762:
-
-```bash
-python models/train.py \
-  --dataset mispeech/speechocean762 \
-  --epochs 10 \
-  --batch_size 4 \
-  --out_dir ckpt_hubert_multitask
-```
-
-CLI inference (with trained checkpoint):
-
-```bash
-python -m inference.infer \
-  --wav "audio/learner/01_learner.wav" \
-  --lang en \
-  --checkpoint ckpt_hubert_multitask/best.pt
-```
-
-CLI inference (random weights, for pipeline testing):
+## How to Reproduce Stage 1 Training
 
 ```bash
-python -m inference.infer --wav "audio/learner/01_learner.wav" --lang en
+# 1. Create and activate a virtual environment
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+
+# 2. Install dependencies
+pip install -r requirements.txt jiwer librosa
+
+# 3. Run training (from the repository root)
+python -m stage1_ctc.train
 ```
 
-FastAPI server:
+The script will:
+1. Download `mispeech/speechocean762` from HuggingFace Hub (~1 GB).
+2. Build `outputs/vocab.json` from training transcripts (skipped if already present).
+3. Preprocess and cache the dataset (multiprocessing, 4 workers).
+4. Fine-tune `facebook/hubert-large-ls960-ft` for 30 epochs.
+5. Save the best checkpoint (by val WER) to `outputs/hubert-large-speechocean-ctc/`.
+6. Write `test_results.json` with the final test-set WER.
+
+---
+
+## How to Reproduce Stage 2 Training
 
 ```bash
-CHECKPOINT_PATH=ckpt_hubert_multitask/best.pt \
-uvicorn inference.api:app --host 0.0.0.0 --port 8000
+# Backbone = stage-1 CTC fine-tuned encoder (default dir: outputs/hubert-large-speechocean-ctc)
+python -m stage2_scoring.train --backbone stage1
+
+# Backbone = stock pretrained HuBERT-Large (facebook/hubert-large-ll60k)
+python -m stage2_scoring.train --backbone hubert-large
+
+# Any explicit checkpoint (overrides --backbone)
+python -m stage2_scoring.train --model <hub-id-or-path>
 ```
 
-Example request behavior:
+Notes:
+- Both backbone options are HuBERT-Large (24 layers, hidden 1024).
+  `--num_unfreeze_hubert_layers` defaults to 12 = top half; pass 24 for full fine-tuning.
+- The text stream uses `Qwen/Qwen3-Embedding-0.6B` (frozen) by default; disable with `--text_model ''`.
+- Completeness (index 4) is excluded from the loss (`ACTIVE_SENT_IDXS` in
+  `stage2_scoring/constants.py`) because SpeechOcean learners almost always score 10/10.
+- Best checkpoint (`best.pt`, by `pearson_total`) and `result.csv` go to
+  `outputs/ckpt_hubert_multitask/`.
 
-- `POST /score` with uploaded wav
-- optional query param: `language=en`
+---
 
-## Dependencies
+## Module Responsibilities (Stage 1)
 
-From `requirements.txt`:
+### `stage1_ctc/config.py`
+Single source of truth for all Stage 1 constants. Edit here to change model,
+dataset, output directory, or any training hyperparameter.
 
-- `numpy`, `scipy`
-- `torch`, `torchaudio`, `transformers`
-- `soundfile`, `webrtcvad`
-- `faster-whisper`
-- `fastapi`, `uvicorn`, `pydantic`
+### `stage1_ctc/processor.py`
+- `normalise_text(text)` — lowercase, strip punctuation except apostrophe,
+  collapse whitespace.
+- `build_vocab(dataset, vocab_path)` — iterates training transcripts, builds a
+  character-level vocab at `outputs/vocab.json` with `|` (word boundary), `[UNK]`, `[PAD]`.
+- `get_processor(vocab_path)` — constructs `Wav2Vec2Processor` from the vocab
+  file. Must be called after `build_vocab`.
 
-`pyworld` is optional in code (not pinned in requirements).
+### `stage1_ctc/data.py`
+- `load_speechocean()` — downloads dataset, resamples audio to 16 kHz,
+  carves 10% validation split from train.
+- `make_preprocess_fn(processor)` — returns a closure that converts a raw
+  sample to `{input_values, attention_mask, labels}`. Samples longer than
+  `MAX_DURATION_SEC` return `None` fields and are later filtered out.
+- `prepare_dataset(dataset, processor)` — applies preprocessing via
+  `dataset.map` and removes too-long rows.
 
+### `stage1_ctc/collator.py`
+`DataCollatorCTCWithPadding` — pads `input_values` and `labels` separately
+(required by CTC). Label padding uses `-100` so loss ignores pad positions.
 
-## Data Representation (Training Sample)
+### `stage1_ctc/metrics.py`
+`make_compute_metrics(processor)` — returns a function that decodes predicted
+and reference token IDs and computes WER via `jiwer`.
 
-Use the following structure as the canonical sample-level representation for dataset rows:
+### `stage1_ctc/model.py`
+`build_model(processor)` — loads `HubertForCTC`, re-initialises the LM head
+to match the vocabulary size, and freezes the CNN feature encoder.
+To enable full fine-tuning, remove `model.freeze_feature_encoder()`.
 
-- Utterance-level fields:
-  - `accuracy` (int)
-  - `completeness` (float)
-  - `fluency` (int)
-  - `prosodic` (int)
-  - `total` (int)
-  - `text` (str)
-  - `speaker` (str)
-  - `gender` (str)
-  - `age` (int)
-- `words` (list[dict]), each item includes:
-  - `text` (str)
-  - `accuracy` (int)
-  - `stress` (int)
-  - `total` (int)
-  - `phones` (list[str])
-  - `phones-accuracy` (list[float])
-  - `mispronunciations` (list)
-- `audio` (dict):
-  - `path` (str)
-  - `bytes` (bytes)
+---
 
-Example shape:
+## Module Responsibilities (Stage 2)
 
-```python
-{
-    'accuracy': 8,
-    'completeness': 10.0,
-    'fluency': 9,
-    'prosodic': 9,
-    'text': 'WE CALL IT BEAR',
-    'total': 8,
-    'words': [
-        {
-            'accuracy': 10,
-            'phones': ['W', 'IY0'],
-            'phones-accuracy': [2.0, 2.0],
-            'stress': 10,
-            'text': 'WE',
-            'total': 10,
-            'mispronunciations': []
-        }
-    ],
-    'speaker': '0001',
-    'gender': 'm',
-    'age': 6,
-    'audio': {'bytes': b'...', 'path': '000010011.wav'}
-}
-```
+### `stage2_scoring/hubert_multitask.py`
+`HubertMultiTask` — HuBERT encoder with learnable layer-weighted sum, optional
+frozen text stream (mean-pooled reference transcript), cross-attention fusion
+(audio Q, text K/V), post-fusion Transformer, MLP head emitting 5 sigmoid
+scores, plus an auxiliary prosody regression head. `forward()` is the training
+path; `forward_inference()` additionally maps ASR word timestamps to frame spans.
 
-## Dataset Inspection Notes
+### `stage2_scoring/collate.py`
+`Collator` — decodes raw audio bytes, resamples to 16 kHz, peak-normalises,
+VAD-trims (webrtcvad), computes prosody targets, zero-mean/unit-std normalises,
+pads, and tokenises reference text. Mirrors the inference preprocessing chain.
 
-The notebook [data/data_inspection.ipynb](/mnt/d/pronunciation_scoring/data/data_inspection.ipynb) is the current inspection entrypoint for the Hugging Face dataset used in training preparation:
+### `stage2_scoring/constants.py`
+`SENT_DIMS`, score scales, `ACTIVE_SENT_IDXS`, `PROSODY_DIMS`,
+`HUBERT_FRAME_HZ` — shared between training and inference. Any change here
+must be reflected in both pipelines.
 
-- Loads `mispeech/speechocean762` with `load_dataset(...)`
-- Casts the `audio` column to `Audio(decode=False)` before row inspection
-- Prints split sizes, feature schema, sample keys, utterance-level fields, first word annotation, and audio metadata
+---
 
-This `decode=False` step is intentional:
+## Common Issues
 
-- it avoids `torchcodec` / FFmpeg runtime failures during dataset inspection
-- it preserves file/path metadata needed for schema review before training collation
-
-For training preparation, treat the inspected dataset annotation as:
-
-- utterance labels: `accuracy`, `completeness`, `fluency`, `prosodic`, `total`
-- utterance metadata: `text`, `speaker`, `gender`, `age`
-- word annotations: `text`, `accuracy`, `stress`, `total`, `phones`, `phones-accuracy`, `mispronunciations`
-- audio metadata payload: at minimum `path`, and optionally `bytes` or decoded array data depending on loader settings
-
-The validation and collation logic in `models/train.py` should stay aligned with this inspected schema.
-
-## Agent Guidelines For This Repo
-
-1. Keep changes modular
-- Put model components in `models/`
-- Put signal/feature helpers in `utils/`
-- Keep orchestration in `inference/`
-
-2. Preserve I/O contracts
-- `predict()` should continue returning the current output schema unless explicitly changed
-- If schema changes, update CLI/API and docs together
-
-3. Be explicit about scoring validity
-- If untrained weights are used, document this in code comments and README/AGENTS updates
-- If adding checkpoint support, validate load path and device mapping
-
-4. Prefer CPU-safe defaults
-- Current defaults are CPU-friendly (`device="cpu"`, Whisper `int8`)
-- Keep defaults stable unless the user requests GPU-first behavior
-
-5. Add minimal tests when changing behavior
-- Validate preprocessing shape/range assumptions
-- Validate mapping from seconds to frame indices
-- Validate fused score clamping `[0,100]`
-
-6. Avoid speculative docs
-- Document only what exists in this repository
-- Mark proposed features as future work
-
-## Suggested Next Extension
-
-If you implement training next, add:
-
-- dataset definition and label format
-- training loop and loss definitions
-- checkpoint save/load
-- evaluator metrics (MAE/RMSE/Pearson/Spearman)
-- config files under `config/`
+| Symptom | Fix |
+|---|---|
+| CUDA out of memory (Stage 1) | Reduce `per_device_train_batch_size` to 2 or disable `gradient_checkpointing` |
+| CUDA out of memory (Stage 2) | Reduce `--batch_size` to 2 or `--num_unfreeze_hubert_layers` |
+| `vocab.json` mismatch | Delete `outputs/vocab.json` and rerun — it will be rebuilt |
+| Slow preprocessing | Increase `num_proc` in `prepare_dataset` or cache with `dataset.save_to_disk` |
+| WER not improving | Try unfreezing CNN encoder (remove `freeze_feature_encoder()`) or lowering LR |
+| `--backbone stage1` dir not found | Run Stage 1 first, or point `--stage1_dir` at the checkpoint directory |
