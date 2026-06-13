@@ -1,3 +1,4 @@
+--extra-index-url https://download.pytorch.org/whl/cu126
 numpy
 scipy
 torch
@@ -6,9 +7,7 @@ transformers>=4.51  # Qwen3-Embedding support
 datasets            # training: load SpeechOcean762
 accelerate          # training: multi-GPU/mixed precision (single-process fallback exists)
 soundfile
+librosa             # required by datasets' Audio feature for resampling (stage1_ctc)
+jiwer               # WER metric (stage1_ctc/metrics.py)
 webrtcvad           # no Windows wheel — on Windows use: pip install webrtcvad-wheels
-faster-whisper
-fastapi
-uvicorn
-pydantic
 pyworld             # optional: F0 prosody features (code falls back to zeros if absent)

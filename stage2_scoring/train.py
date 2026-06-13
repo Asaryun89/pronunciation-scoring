@@ -214,6 +214,12 @@ def main():
     ap.add_argument("--num_unfreeze_hubert_layers", type=int, default=12,
                     help="Unfreeze top-N HuBERT transformer layers (0 = all frozen; "
                          "HuBERT-Large has 24, so the default trains the top half)")
+    ap.add_argument("--use_multires_hubert", action="store_true",
+                    help="Use MultiResHuBERT: mix multiple independent layer-weighted "
+                         "streams instead of a single layer-weighted sum")
+    ap.add_argument("--num_res_streams", type=int, default=4,
+                    help="Number of layer-weighted streams for MultiResHuBERT "
+                         "(only used with --use_multires_hubert)")
     ap.add_argument("--num_workers", type=int,   default=4)
     ap.add_argument("--seed",        type=int,   default=42)
     ap.add_argument("--w_sent",      type=float, default=1.0)
@@ -298,6 +304,8 @@ def main():
         text_model_name=args.text_model or None,
         freeze_text_encoder=not args.no_freeze_text,
         prosody_feat_dim=len(PROSODY_DIMS),
+        use_multires_hubert=args.use_multires_hubert,
+        num_res_streams=args.num_res_streams,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     scheduler = make_warmup_scheduler(optimizer, args.warmup_steps)

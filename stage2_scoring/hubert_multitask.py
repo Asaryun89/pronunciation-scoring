@@ -48,6 +48,7 @@ if _root not in sys.path:
     sys.path.insert(0, _root)
 
 from stage2_scoring.scoring_heads import CrossAttentionFusion, MLPScoringHead  # noqa: E402
+from stage2_scoring.multires_hubert import MultiResHuBERT                      # noqa: E402
 from utils.alignment import build_word_segments                         # noqa: E402
 
 
@@ -69,6 +70,10 @@ class HubertMultiTask(nn.Module):
     text_model_name             : embedding model for the text stream ('' / None = disabled)
     freeze_text_encoder         : keep text encoder weights frozen during training
     prosody_feat_dim            : auxiliary prosody output dimension (default 5)
+    use_multires_hubert         : replace the single layer-weighted sum with MultiResHuBERT,
+                                   which mixes multiple independent layer-weighted streams
+    num_res_streams             : number of streams for MultiResHuBERT (only used when
+                                   use_multires_hubert=True)
     """
 
     def __init__(
@@ -85,34 +90,48 @@ class HubertMultiTask(nn.Module):
         text_model_name:              Optional[str] = "Qwen/Qwen3-Embedding-0.6B",
         freeze_text_encoder:          bool          = True,
         prosody_feat_dim:             int           = 5,
+        use_multires_hubert:          bool          = False,
+        num_res_streams:              int           = 4,
     ):
         super().__init__()
 
         # ── HuBERT backbone ───────────────────────────────────────────────
-        self.hubert = HubertModel.from_pretrained(model_name)
-        if freeze_fe:
-            self.hubert.feature_extractor._freeze_parameters()
+        self.use_multires_hubert = use_multires_hubert
+        if use_multires_hubert:
+            # MultiResHuBERT mixes `num_res_streams` independent layer-weighted
+            # sums of HuBERT's hidden states and projects the result to d_model.
+            self.audio_encoder = MultiResHuBERT(
+                model_name, d_model,
+                num_streams=num_res_streams,
+                freeze_fe=freeze_fe,
+                num_unfreeze_hubert_layers=num_unfreeze_hubert_layers,
+            )
+            self.hubert = self.audio_encoder.hubert
+        else:
+            self.hubert = HubertModel.from_pretrained(model_name)
+            if freeze_fe:
+                self.hubert.feature_extractor._freeze_parameters()
 
-        # Partial HuBERT unfreezing: top-N transformer encoder layers become trainable.
-        # All other transformer parameters remain frozen (requires_grad stays False from
-        # HuggingFace default — HuBERT is fully trainable by default, so we flip it).
-        if num_unfreeze_hubert_layers < self.hubert.config.num_hidden_layers:
-            for p in self.hubert.encoder.parameters():
-                p.requires_grad = False
-            if num_unfreeze_hubert_layers > 0:
-                for layer in self.hubert.encoder.layers[-num_unfreeze_hubert_layers:]:
-                    for p in layer.parameters():
-                        p.requires_grad = True
+            # Partial HuBERT unfreezing: top-N transformer encoder layers become trainable.
+            # All other transformer parameters remain frozen (requires_grad stays False from
+            # HuggingFace default — HuBERT is fully trainable by default, so we flip it).
+            if num_unfreeze_hubert_layers < self.hubert.config.num_hidden_layers:
+                for p in self.hubert.encoder.parameters():
+                    p.requires_grad = False
+                if num_unfreeze_hubert_layers > 0:
+                    for layer in self.hubert.encoder.layers[-num_unfreeze_hubert_layers:]:
+                        for p in layer.parameters():
+                            p.requires_grad = True
 
-        H        = self.hubert.config.hidden_size       # 1024 for hubert-large
-        n_layers = self.hubert.config.num_hidden_layers + 1  # transformer layers + embedding layer
+            H        = self.hubert.config.hidden_size       # 1024 for hubert-large
+            n_layers = self.hubert.config.num_hidden_layers + 1  # transformer layers + embedding layer
 
-        # Learnable scalar weights for the layer-weighted sum.
-        # Softmax is applied at runtime so they always form a valid convex combination.
-        self.layer_weights = nn.Parameter(torch.ones(n_layers))
+            # Learnable scalar weights for the layer-weighted sum.
+            # Softmax is applied at runtime so they always form a valid convex combination.
+            self.layer_weights = nn.Parameter(torch.ones(n_layers))
 
-        # Audio linear projection: H → d_model
-        self.audio_proj = nn.Linear(H, d_model)
+            # Audio linear projection: H → d_model
+            self.audio_proj = nn.Linear(H, d_model)
 
         # ── Optional text encoder (BERT-style) ────────────────────────────
         self.text_encoder = None
@@ -204,6 +223,17 @@ class HubertMultiTask(nn.Module):
         weights = torch.softmax(self.layer_weights, dim=0) # (n_layers,)  sum to 1
         return (weights[:, None, None, None] * stacked).sum(dim=0)  # (B, T, H)
 
+    def _encode_audio(
+        self,
+        input_values:   torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run the audio backbone and project to (B, T, d_model)."""
+        if self.use_multires_hubert:
+            return self.audio_encoder(input_values, attention_mask)
+        hidden = self._layer_weighted_encode(input_values, attention_mask)
+        return self.audio_proj(hidden)
+
     def _encode_text(
         self,
         text_input_ids:      Optional[torch.Tensor],  # (B, L)
@@ -252,16 +282,15 @@ class HubertMultiTask(nn.Module):
         prosody_pred (B, prosody_feat_dim) — auxiliary prosody prediction (unbounded)
         """
         # ── Audio path ────────────────────────────────────────────────
-        hidden    = self._layer_weighted_encode(input_values, attention_mask)  # (B, T, H)
-        audio_emb = self.audio_proj(hidden)                                    # (B, T, d_model)
+        audio_emb = self._encode_audio(input_values, attention_mask)  # (B, T, d_model)
 
         # ── Text path ─────────────────────────────────────────────────
         # Mean pool → Linear+LN → (B, 1, d_model) used as K/V in cross-attention
         text_emb_kv = None
         if self.text_encoder is not None and text_input_ids is not None:
             text_emb    = self._encode_text(
-                text_input_ids.to(hidden.device),
-                text_attention_mask.to(hidden.device) if text_attention_mask is not None else None,
+                text_input_ids.to(audio_emb.device),
+                text_attention_mask.to(audio_emb.device) if text_attention_mask is not None else None,
             )                                               # (B, text_H)
             text_emb_kv = self.text_proj(text_emb).unsqueeze(1)  # (B, 1, d_model)
 
@@ -324,8 +353,7 @@ class HubertMultiTask(nn.Module):
         frame_hz   : estimated HuBERT frame rate (frames/sec)
         """
         # ── Audio path ────────────────────────────────────────────────
-        hidden    = self._layer_weighted_encode(input_values)  # (1, T, H)
-        audio_emb = self.audio_proj(hidden)                    # (1, T, d_model)
+        audio_emb = self._encode_audio(input_values)  # (1, T, d_model)
         T         = audio_emb.size(1)
         device    = audio_emb.device
 
